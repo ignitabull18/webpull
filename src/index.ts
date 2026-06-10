@@ -5,7 +5,7 @@ import { Effect } from "effect"
 import { frontmatter } from "./convert"
 import { isSPAShell } from "./detect"
 import { discover } from "./discover"
-import { compressDir } from "./merge"
+import { compressDir, mergeIntoFile, splitIntoFiles } from "./merge"
 import { WorkerPool } from "./pool"
 import { closeBrowser } from "./renderer"
 import { createUI } from "./ui"
@@ -16,6 +16,8 @@ interface Config {
 	out: string
 	max: number
 	zip: boolean
+	merge: boolean
+	split: number
 }
 
 const parseArgs = (args: string[]): Config => {
@@ -28,6 +30,8 @@ const parseArgs = (args: string[]): Config => {
     -o, --out <dir>   Output directory (default: ./<hostname>)
     -m, --max <n>     Max pages (default: 500)
     -z, --zip         Create a .zip archive of the output
+    --merge           Merge all pages into a single _merged.md file
+    --split <n>       Split pages evenly across <n> files
 `)
 		process.exit(0)
 	}
@@ -46,6 +50,8 @@ const parseArgs = (args: string[]): Config => {
 	let out = `./${url.hostname}`
 	let max = 500
 	let zip = false
+	let merge = false
+	let split = 0
 
 	for (let i = 1; i < args.length; i++) {
 		const arg = args[i]
@@ -56,10 +62,17 @@ const parseArgs = (args: string[]): Config => {
 		} else if (("-m" === arg || "--max" === arg) && next) {
 			max = +next
 			i++
+		} else if ("-z" === arg || "--zip" === arg) {
+			zip = true
+		} else if ("--merge" === arg) {
+			merge = true
+		} else if ("--split" === arg && next) {
+			split = +next
+			i++
 		}
 	}
 
-	return { url: url.href, out: resolve(out), max, zip }
+	return { url: url.href, out: resolve(out), max, zip, merge, split }
 }
 
 const program = Effect.gen(function* () {
@@ -157,12 +170,37 @@ const program = Effect.gen(function* () {
 
 		ui.render({ total, ok, err, elapsed: (performance.now() - tDisc) / 1000, workerStates, recentFiles })
 		ui.finish()
+
 		// Compress output if -z/--zip was passed
 		let zipPath = ""
 		if (config.zip && ok > 0) {
 			process.stderr.write("  \x1b[90mCompressing...\x1b[0m")
 			try {
 				zipPath = yield* compressDir(config.out)
+				process.stderr.write(" \x1b[32mdone\x1b[0m\n")
+			} catch (e) {
+				process.stderr.write(` \x1b[31mfailed: ${e}\x1b[0m\n`)
+			}
+		}
+
+		// Merge into single file if --merge was passed
+		let mergePath = ""
+		if (config.merge && ok > 0) {
+			process.stderr.write("  \x1b[90mMerging into single file...\x1b[0m")
+			try {
+				mergePath = yield* mergeIntoFile(config.out)
+				process.stderr.write(" \x1b[32mdone\x1b[0m\n")
+			} catch (e) {
+				process.stderr.write(` \x1b[31mfailed: ${e}\x1b[0m\n`)
+			}
+		}
+
+		// Split into N files if --split was passed
+		let splitPaths: string[] = []
+		if (config.split > 0 && ok > 0) {
+			process.stderr.write(`  \x1b[90mSplitting into ${config.split} files...\x1b[0m`)
+			try {
+				splitPaths = yield* splitIntoFiles(config.out, config.split)
 				process.stderr.write(" \x1b[32mdone\x1b[0m\n")
 			} catch (e) {
 				process.stderr.write(` \x1b[31mfailed: ${e}\x1b[0m\n`)
@@ -177,6 +215,8 @@ const program = Effect.gen(function* () {
 		)
 		if (err) process.stderr.write(`  \x1b[31m${err} failed\x1b[0m\n`)
 		if (zipPath) process.stderr.write(`  \x1b[90mArchive: ${zipPath}\x1b[0m\n`)
+		if (mergePath) process.stderr.write(`  \x1b[90mMerged: ${mergePath}\x1b[0m\n`)
+		if (splitPaths.length) for (const p of splitPaths) process.stderr.write(`  \x1b[90mSplit: ${p}\x1b[0m\n`)
 		process.stderr.write("\n")
 	} finally {
 		pool?.terminate()
