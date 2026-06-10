@@ -298,6 +298,7 @@ const server = Bun.serve({
 })
 
 console.log(`\n  ⚡ webpull server · http://localhost:${PORT}\n`)
-Bun.spawn(["open", `http://localhost:${PORT}`], { stdio: ["ignore", "ignore", "ignore"] })
+// Open browser — ignore if it fails (e.g. headless env)
+try { Bun.spawn(["open", `http://localhost:${PORT}`], { stdio: ["ignore", "ignore", "ignore"] }) } catch {}
 
 export { server }
