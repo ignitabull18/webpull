@@ -5,6 +5,7 @@ import { Effect } from "effect"
 import { frontmatter } from "./convert"
 import { isSPAShell } from "./detect"
 import { discover } from "./discover"
+import { compressDir } from "./merge"
 import { WorkerPool } from "./pool"
 import { closeBrowser } from "./renderer"
 import { createUI } from "./ui"
@@ -14,6 +15,7 @@ interface Config {
 	url: string
 	out: string
 	max: number
+	zip: boolean
 }
 
 const parseArgs = (args: string[]): Config => {
@@ -25,6 +27,7 @@ const parseArgs = (args: string[]): Config => {
 
     -o, --out <dir>   Output directory (default: ./<hostname>)
     -m, --max <n>     Max pages (default: 500)
+    -z, --zip         Create a .zip archive of the output
 `)
 		process.exit(0)
 	}
@@ -42,6 +45,7 @@ const parseArgs = (args: string[]): Config => {
 
 	let out = `./${url.hostname}`
 	let max = 500
+	let zip = false
 
 	for (let i = 1; i < args.length; i++) {
 		const arg = args[i]
@@ -55,7 +59,7 @@ const parseArgs = (args: string[]): Config => {
 		}
 	}
 
-	return { url: url.href, out: resolve(out), max }
+	return { url: url.href, out: resolve(out), max, zip }
 }
 
 const program = Effect.gen(function* () {
@@ -153,6 +157,17 @@ const program = Effect.gen(function* () {
 
 		ui.render({ total, ok, err, elapsed: (performance.now() - tDisc) / 1000, workerStates, recentFiles })
 		ui.finish()
+		// Compress output if -z/--zip was passed
+		let zipPath = ""
+		if (config.zip && ok > 0) {
+			process.stderr.write("  \x1b[90mCompressing...\x1b[0m")
+			try {
+				zipPath = yield* compressDir(config.out)
+				process.stderr.write(" \x1b[32mdone\x1b[0m\n")
+			} catch (e) {
+				process.stderr.write(` \x1b[31mfailed: ${e}\x1b[0m\n`)
+			}
+		}
 
 		const elapsed = ((performance.now() - t0) / 1000).toFixed(1)
 		const pps = Math.round(ok / ((performance.now() - tDisc) / 1000))
@@ -161,6 +176,7 @@ const program = Effect.gen(function* () {
 			`\n  \x1b[32m\x1b[1mDone!\x1b[0m ${ok} pages in ${elapsed}s \x1b[90m(${pps} pages/sec)\x1b[0m\n`,
 		)
 		if (err) process.stderr.write(`  \x1b[31m${err} failed\x1b[0m\n`)
+		if (zipPath) process.stderr.write(`  \x1b[90mArchive: ${zipPath}\x1b[0m\n`)
 		process.stderr.write("\n")
 	} finally {
 		pool?.terminate()

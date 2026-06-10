@@ -38,5 +38,9 @@
 			"quoteStyle": "double",
 			"semicolons": "asNeeded"
 		}
+	},
+	"files": {
+		"includes": ["src/**", "ui/src/**", "ui/index.html"],
+		"maxSize": 2000000
 	}
 }

@@ -74,7 +74,7 @@ const extractNav = (base: URL, html: string) =>
 		const urls = new Set<string>()
 
 		for (const sel of NAV_SELECTORS) {
-			for (const link of document.querySelectorAll(sel)) {
+			for (const link of Array.from(document.querySelectorAll(sel))) {
 				const href = link.getAttribute("href")
 				if (!href || href.startsWith("#") || href.startsWith("javascript:") || href.startsWith("mailto:")) continue
 				try {
