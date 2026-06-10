@@ -52,6 +52,16 @@ export default function Home() {
 		}
 	}
 
+	const normalizedUrl = (() => {
+		try {
+			let u = url.trim()
+			if (!/^https?:\/\//i.test(u)) u = `https://${u}`
+			return u
+		} catch {
+			return url.trim()
+		}
+	})()
+
 	const handleStart = async () => {
 		if (!url.trim()) return
 		setLoading(true)
@@ -61,7 +71,7 @@ export default function Home() {
 				method: "POST",
 				headers: { "content-type": "application/json" },
 				body: JSON.stringify({
-					url: url.trim(),
+					url: normalizedUrl,
 					outDir: outDir || undefined,
 					maxPages,
 					workerCount: workerCount || undefined,
