@@ -29,5 +29,8 @@
 		"react-router-dom": "^7.17.0",
 		"react-syntax-highlighter": "^16.1.1",
 		"remark-gfm": "^4.0.1"
+	},
+	"scripts": {
+		"build:ui": "bun build ui/src/main.tsx --outdir ui/dist --target browser"
 	}
 }

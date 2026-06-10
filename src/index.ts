@@ -32,6 +32,7 @@ const parseArgs = (args: string[]): Config => {
     -z, --zip         Create a .zip archive of the output
     --merge           Merge all pages into a single _merged.md file
     --split <n>       Split pages evenly across <n> files
+    --server          Start the web UI (default when no URL given)
 `)
 		process.exit(0)
 	}
@@ -75,8 +76,18 @@ const parseArgs = (args: string[]): Config => {
 	return { url: url.href, out: resolve(out), max, zip, merge, split }
 }
 
+const args = process.argv.slice(2)
+const isServer = args.length === 0 || args.includes("--server")
+
+// No CLI args → start web server
+if (isServer) {
+	const { server } = await import("./server")
+	// Keep process alive (server runs until terminated)
+	await new Promise(() => {})
+}
+
 const program = Effect.gen(function* () {
-	const config = parseArgs(process.argv.slice(2))
+	const config = parseArgs(args)
 	const t0 = performance.now()
 	let workerCount = Math.max(8, cpus().length * 2)
 	let pool: WorkerPool | null = null
