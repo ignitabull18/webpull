@@ -124,7 +124,7 @@ const parseArgs = (args: string[]): Config => {
 		}
 	}
 
-	return { source, url: source ? rawUrl : "", out: resolve(out), max, zip, merge, split }
+	return { source, url: rawUrl, out: resolve(out), max, zip, merge, split }
 }
 
 // --- Source pull pipeline ---
@@ -242,6 +242,7 @@ function runUrlPull(config: Config): Effect.Effect<void, Error> {
 
 			let ok = 0
 			let err = 0
+			const writes: Promise<void>[] = []
 			const recentFiles: string[] = []
 			const workerStates = new Array<"idle" | "busy">(workerCount).fill("idle")
 			const workerMap = new Map<number, number>()
@@ -289,7 +290,13 @@ function runUrlPull(config: Config): Effect.Effect<void, Error> {
 							if (!filepath.endsWith(".md")) filepath += ".md"
 							recentFiles.push(filepath)
 
-							Effect.runPromise(write(page, config.out))
+							const writePromise = Effect.runPromise(write(page, config.out))
+								.then(() => undefined)
+								.catch(() => {
+									ok--
+									err++
+								})
+							writes.push(writePromise)
 						} else {
 							err++
 						}
@@ -297,6 +304,7 @@ function runUrlPull(config: Config): Effect.Effect<void, Error> {
 					},
 				),
 			)
+			yield* Effect.tryPromise(() => Promise.all(writes))
 
 			ui.render({ total, ok, err, elapsed: (performance.now() - tDisc) / 1000, workerStates, recentFiles })
 			ui.finish()

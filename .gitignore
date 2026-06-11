@@ -5,6 +5,11 @@ node_modules
 out
 dist
 *.tgz
+download.html
+example.com/
+ignitabull.com/
+pulls/
+src/.tmp-*
 
 # code coverage
 coverage

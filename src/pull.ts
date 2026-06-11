@@ -15,6 +15,7 @@ export interface PullConfig {
 	max: number
 	workerCount?: number
 	pullId?: string
+	signal?: AbortSignal
 }
 
 export type PullEvent =
@@ -44,7 +45,9 @@ export function runPull(config: PullConfig, onProgress?: ProgressCallback): Effe
 		let pool: WorkerPool | null = null
 
 		try {
+			if (config.signal?.aborted) return yield* Effect.fail(new Error("Pull cancelled"))
 			const urls = yield* discover(url, max)
+			if (config.signal?.aborted) return yield* Effect.fail(new Error("Pull cancelled"))
 			if (!urls.length) {
 				onProgress?.({ type: "error", message: "No pages found." })
 				return yield* Effect.fail(new Error("No pages found."))
@@ -70,6 +73,7 @@ export function runPull(config: PullConfig, onProgress?: ProgressCallback): Effe
 
 			let ok = 0
 			let err = 0
+			const writes: Promise<void>[] = []
 
 			yield* Effect.tryPromise(() =>
 				activePool.pullAll(
@@ -96,19 +100,33 @@ export function runPull(config: PullConfig, onProgress?: ProgressCallback): Effe
 							filepath = filepath.replace(/\.html?$/, "").replace(/^\//, "")
 							if (!filepath.endsWith(".md")) filepath += ".md"
 
-							Effect.runPromise(write(page, out))
-
-							onProgress?.({
-								type: "progress",
-								index: idx,
-								url: finalUrl,
-								status: "ok",
-								file: filepath,
-								title,
-								content,
-								ok,
-								err,
-							})
+							const writePromise = Effect.runPromise(write(page, out))
+								.then(() => {
+									onProgress?.({
+										type: "progress",
+										index: idx,
+										url: finalUrl,
+										status: "ok",
+										file: filepath,
+										title,
+										content,
+										ok,
+										err,
+									})
+								})
+								.catch(() => {
+									ok--
+									err++
+									onProgress?.({
+										type: "progress",
+										index: idx,
+										url: finalUrl,
+										status: "err",
+										ok,
+										err,
+									})
+								})
+							writes.push(writePromise)
 						} else {
 							err++
 							onProgress?.({
@@ -121,8 +139,10 @@ export function runPull(config: PullConfig, onProgress?: ProgressCallback): Effe
 							})
 						}
 					},
+					config.signal,
 				),
 			)
+			yield* Effect.tryPromise(() => Promise.all(writes))
 
 			const elapsed = (performance.now() - t0) / 1000
 			onProgress?.({ type: "complete", ok, err, elapsed })

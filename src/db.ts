@@ -23,6 +23,9 @@ function initSchema(d: Database) {
 		CREATE TABLE IF NOT EXISTS pulls (
 			id TEXT PRIMARY KEY,
 			url TEXT NOT NULL,
+			source TEXT NOT NULL DEFAULT '',
+			dest TEXT NOT NULL DEFAULT '',
+			project_id TEXT,
 			out_dir TEXT NOT NULL,
 			max_pages INTEGER NOT NULL DEFAULT 500,
 			worker_count INTEGER NOT NULL DEFAULT 16,
@@ -33,6 +36,24 @@ function initSchema(d: Database) {
 			finished_at TEXT
 		)
 	`)
+	// Add source column for existing databases that lack it
+	try {
+		d.exec("ALTER TABLE pulls ADD COLUMN source TEXT NOT NULL DEFAULT ''")
+	} catch {
+		// Column already exists — ignore
+	}
+	// Add dest column for existing databases that lack it
+	try {
+		d.exec("ALTER TABLE pulls ADD COLUMN dest TEXT NOT NULL DEFAULT ''")
+	} catch {
+		// Column already exists — ignore
+	}
+	// Add project_id column for existing databases that lack it
+	try {
+		d.exec("ALTER TABLE pulls ADD COLUMN project_id TEXT REFERENCES projects(id) ON DELETE SET NULL")
+	} catch {
+		// Column already exists — ignore
+	}
 	d.exec(`
 		CREATE TABLE IF NOT EXISTS documents (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,6 +67,26 @@ function initSchema(d: Database) {
 	`)
 	d.exec(`
 		CREATE INDEX IF NOT EXISTS idx_documents_pull_id ON documents(pull_id)
+	`)
+	d.exec(`
+		DELETE FROM documents
+		WHERE id NOT IN (
+			SELECT MAX(id)
+			FROM documents
+			GROUP BY pull_id, path
+		)
+	`)
+	d.exec(`
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_pull_path ON documents(pull_id, path)
+	`)
+	d.exec(`
+		CREATE TABLE IF NOT EXISTS projects (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL UNIQUE,
+			description TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL DEFAULT (datetime('now')),
+			updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+		)
 	`)
 	d.exec(`
 		CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
@@ -76,6 +117,9 @@ function initSchema(d: Database) {
 export interface PullRow {
 	id: string
 	url: string
+	source: string
+	dest: string
+	project_id: string | null
 	out_dir: string
 	max_pages: number
 	worker_count: number
@@ -89,19 +133,34 @@ export interface PullRow {
 export function createPull(pull: {
 	id: string
 	url: string
+	source?: string
+	dest?: string
 	outDir: string
 	maxPages: number
 	workerCount: number
+	projectId?: string
 }): void {
 	const d = getDb()
 	d.run(
-		`INSERT INTO pulls (id, url, out_dir, max_pages, worker_count, status, pages_ok, pages_err, started_at)
-		 VALUES (?, ?, ?, ?, ?, 'running', 0, 0, datetime('now'))`,
-		[pull.id, pull.url, pull.outDir, pull.maxPages, pull.workerCount],
+		`INSERT INTO pulls (id, url, source, dest, project_id, out_dir, max_pages, worker_count, status, pages_ok, pages_err, started_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', 0, 0, datetime('now'))`,
+		[
+			pull.id,
+			pull.url,
+			pull.source || "",
+			pull.dest || "",
+			pull.projectId || null,
+			pull.outDir,
+			pull.maxPages,
+			pull.workerCount,
+		],
 	)
 }
 
-export function updatePull(id: string, updates: { status?: string; pagesOk?: number; pagesErr?: number }): void {
+export function updatePull(
+	id: string,
+	updates: { status?: string; pagesOk?: number; pagesErr?: number; dest?: string },
+): void {
 	const d = getDb()
 	const sets: string[] = []
 	const vals: (string | number)[] = []
@@ -121,10 +180,19 @@ export function updatePull(id: string, updates: { status?: string; pagesOk?: num
 		sets.push("pages_err = ?")
 		vals.push(updates.pagesErr)
 	}
+	if (updates.dest !== undefined) {
+		sets.push("dest = ?")
+		vals.push(updates.dest)
+	}
 
 	if (sets.length === 0) return
 	vals.push(id)
 	d.run(`UPDATE pulls SET ${sets.join(", ")} WHERE id = ?`, vals as any)
+}
+
+export function setPullProject(pullId: string, projectId: string | null): void {
+	const d = getDb()
+	d.run("UPDATE pulls SET project_id = ? WHERE id = ?", [projectId, pullId])
 }
 
 export function getPull(id: string): PullRow | null {
@@ -135,6 +203,11 @@ export function getPull(id: string): PullRow | null {
 export function listPulls(limit = 20): PullRow[] {
 	const d = getDb()
 	return d.query("SELECT * FROM pulls ORDER BY started_at DESC LIMIT ?").all(limit) as PullRow[]
+}
+
+export function listPullsByProject(projectId: string): PullRow[] {
+	const d = getDb()
+	return d.query("SELECT * FROM pulls WHERE project_id = ? ORDER BY started_at DESC").all(projectId) as PullRow[]
 }
 
 export function deletePull(id: string): void {
@@ -161,20 +234,29 @@ export function insertDocument(doc: {
 	content: string
 }): void {
 	const d = getDb()
-	d.run("INSERT INTO documents (pull_id, path, url, title, content) VALUES (?, ?, ?, ?, ?)", [
-		doc.pullId,
-		doc.path,
-		doc.url,
-		doc.title,
-		doc.content,
-	])
+	d.run(
+		`INSERT INTO documents (pull_id, path, url, title, content)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(pull_id, path) DO UPDATE SET
+			url = excluded.url,
+			title = excluded.title,
+			content = excluded.content`,
+		[doc.pullId, doc.path, doc.url, doc.title, doc.content],
+	)
 }
 
 export function insertDocuments(
 	docs: { pullId: string; path: string; url: string; title: string; content: string }[],
 ): void {
 	const d = getDb()
-	const insert = d.prepare("INSERT INTO documents (pull_id, path, url, title, content) VALUES (?, ?, ?, ?, ?)")
+	const insert = d.prepare(
+		`INSERT INTO documents (pull_id, path, url, title, content)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(pull_id, path) DO UPDATE SET
+			url = excluded.url,
+			title = excluded.title,
+			content = excluded.content`,
+	)
 	d.transaction(() => {
 		for (const doc of docs) {
 			insert.run(doc.pullId, doc.path, doc.url, doc.title, doc.content)
@@ -196,6 +278,11 @@ export function getDoc(pullId: string, docPath: string): DocRow | null {
 		.get(pullId, docPath) as DocRow | null
 }
 
+export function getDocById(id: number): DocRow | null {
+	const d = getDb()
+	return d.query("SELECT id, pull_id, path, url, title, content FROM documents WHERE id = ?").get(id) as DocRow | null
+}
+
 // --- Search ---
 
 export interface SearchResult extends DocRow {
@@ -205,7 +292,6 @@ export interface SearchResult extends DocRow {
 
 export function searchDocs(query: string, limit = 50): SearchResult[] {
 	const d = getDb()
-	// Escape FTS5 special characters in the query
 	const safe = query.replace(/['"*()]/g, "").trim()
 	if (!safe) return []
 	return d
@@ -236,4 +322,92 @@ export function searchDocsInPull(pullId: string, query: string, limit = 50): Sea
 			 LIMIT ?`,
 		)
 		.all(pullId, safe, limit) as SearchResult[]
+}
+
+export function searchDocsInProject(projectId: string, query: string, limit = 50): SearchResult[] {
+	const d = getDb()
+	const safe = query.replace(/['"*()]/g, "").trim()
+	if (!safe) return []
+	return d
+		.query(
+			`SELECT d.id, d.pull_id, d.path, d.url, d.title, d.content, p.url as pull_url, rank
+			 FROM documents_fts f
+			 JOIN documents d ON d.id = f.rowid
+			 JOIN pulls p ON p.id = d.pull_id
+			 WHERE p.project_id = ? AND documents_fts MATCH ?
+			 ORDER BY rank
+			 LIMIT ?`,
+		)
+		.all(projectId, safe, limit) as SearchResult[]
+}
+// --- Project CRUD ---
+
+export interface ProjectRow {
+	id: string
+	name: string
+	description: string
+	created_at: string
+	updated_at: string
+}
+
+export function createProject(name: string, description = ""): ProjectRow {
+	const d = getDb()
+	const id = crypto.randomUUID()
+	d.run("INSERT INTO projects (id, name, description) VALUES (?, ?, ?)", [id, name, description])
+	return { id, name, description, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }
+}
+
+export function listProjects(): ProjectRow[] {
+	const d = getDb()
+	return d.query("SELECT * FROM projects ORDER BY updated_at DESC").all() as ProjectRow[]
+}
+
+export function getProject(id: string): ProjectRow | null {
+	const d = getDb()
+	return d.query("SELECT * FROM projects WHERE id = ?").get(id) as ProjectRow | null
+}
+
+export function updateProject(id: string, updates: { name?: string; description?: string }): void {
+	const d = getDb()
+	const sets: string[] = []
+	const vals: (string | number)[] = []
+	if (updates.name !== undefined) {
+		sets.push("name = ?")
+		vals.push(updates.name)
+	}
+	if (updates.description !== undefined) {
+		sets.push("description = ?")
+		vals.push(updates.description)
+	}
+	if (sets.length === 0) return
+	sets.push("updated_at = datetime('now')")
+	vals.push(id)
+	d.run(`UPDATE projects SET ${sets.join(", ")} WHERE id = ?`, vals as any)
+}
+
+export function deleteProject(id: string): void {
+	const d = getDb()
+	d.run("UPDATE pulls SET project_id = NULL WHERE project_id = ?", [id])
+	d.run("DELETE FROM projects WHERE id = ?", [id])
+}
+
+export function getProjectDocCount(projectId: string): number {
+	const d = getDb()
+	const row = d
+		.query("SELECT COUNT(*) as cnt FROM documents d JOIN pulls p ON p.id = d.pull_id WHERE p.project_id = ?")
+		.get(projectId) as { cnt: number } | null
+	return row?.cnt ?? 0
+}
+
+export function listDocsByProject(projectId: string): DocRow[] {
+	const d = getDb()
+	return d
+		.query(
+			`SELECT d.id, d.pull_id, d.path, d.url, d.title, d.content
+			 FROM documents d
+			 JOIN pulls p ON p.id = d.pull_id
+			 WHERE p.project_id = ?
+			 ORDER BY d.path`,
+		)
+		.all(projectId) as DocRow[]
 }

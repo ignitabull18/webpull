@@ -1,29 +1,33 @@
 import { Effect } from "effect"
-import type { SourceAdapter, SourceConfig, SourceContent, SourceItem } from "./types"
+import { withRetry } from "./retry"
+import type { SourceAdapter, SourceConfig, SourceContent, SourceItem, SourceStatus } from "./types"
 
-function exec(cmd: string[]): Effect.Effect<string, Error> {
-	return Effect.tryPromise({
-		try: async () => {
-			const proc = Bun.spawnSync(cmd, { stdout: "pipe", stderr: "pipe" })
-			if (proc.exitCode !== 0) {
-				const errText = new TextDecoder().decode(proc.stderr)
-				throw new Error(`opencli exited ${proc.exitCode}: ${errText.trimEnd()}`)
-			}
-			return new TextDecoder().decode(proc.stdout)
-		},
-		catch: (e) => new Error(`Failed to run opencli: ${e}`),
-	})
+const EXEC_TIMEOUT = 30_000
+
+async function execAsync(cmd: string[]): Promise<string> {
+	const proc = Bun.spawn(cmd, { stdout: "pipe", stderr: "pipe" })
+	const timeout = setTimeout(() => proc.kill(), EXEC_TIMEOUT)
+	try {
+		const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()])
+		const exitCode = await proc.exited
+		if (exitCode !== 0) {
+			const reason = proc.killed ? "timed out" : `exited ${exitCode}`
+			throw new Error(`opencli ${reason}: ${stderr.trimEnd()}`)
+		}
+		return stdout
+	} finally {
+		clearTimeout(timeout)
+	}
 }
 
 function execJson<T>(cmd: string[]): Effect.Effect<T, Error> {
-	return exec(cmd).pipe(
-		Effect.flatMap((out) =>
-			Effect.try({
-				try: () => JSON.parse(out.trim() || "[]") as T,
-				catch: (e) => new Error(`JSON parse: ${e}`),
-			}),
-		),
-	)
+	return Effect.tryPromise({
+		try: async () => {
+			const out = await execAsync(cmd)
+			return JSON.parse(out.trim() || "[]") as T
+		},
+		catch: (e) => new Error(`Failed to run opencli: ${e}`),
+	})
 }
 
 interface Tweet {
@@ -53,42 +57,60 @@ interface BookmarkFolder {
 	created_at?: string
 }
 
-/**
- * Twitter/X source adapter.
- *
- * Supports:
- * - Bookmarks: all bookmarks or a specific folder
- * - User tweets: recent tweets from a user
- * - Threads: full conversation thread
- * - Search: keyword/operator search
- * - Lists: tweet list timeline
- *
- * Uses `opencli twitter` under the hood. Requires Chrome with an active X session.
- */
 class TwitterAdapter implements SourceAdapter {
 	readonly name = "Twitter"
+
+	checkStatus(): Effect.Effect<SourceStatus, Error> {
+		return Effect.gen(this, function* () {
+			const which = Bun.spawnSync(["which", "opencli"], { stdout: "pipe", stderr: "pipe" })
+			const installed = which.exitCode === 0
+			if (!installed) {
+				return { installed: false, authenticated: false, message: "opencli not installed. Run: npm i -g opencli" }
+			}
+
+			// Async auth check
+			const checkResult = yield* Effect.either(
+				execJson<unknown>([
+					"opencli",
+					"twitter",
+					"bookmark-folders",
+					"--limit",
+					"1",
+					"--window",
+					"background",
+					"-f",
+					"json",
+				]),
+			)
+
+			if (checkResult._tag === "Right") {
+				return { installed: true, authenticated: true, message: "Ready — X session active in Chrome" }
+			}
+
+			const errMsg = String(checkResult.left).toLowerCase()
+			if (errMsg.includes("auth") || errMsg.includes("login") || errMsg.includes("not logged")) {
+				return { installed: true, authenticated: false, message: "Not authenticated — log into X in Chrome first" }
+			}
+			return { installed: true, authenticated: false, message: "Chrome session may not be available" }
+		})
+	}
 
 	discover(config: SourceConfig): Effect.Effect<SourceItem[], Error> {
 		return Effect.gen(this, function* () {
 			const target = config.target.trim()
-			const opencliBase = ["opencli", "twitter"]
+			const base = ["opencli", "twitter"]
 			const windowOpts = ["--window", "background"]
 
-			// --- Bookmark folders ---
 			if (target === "bookmarks" || target === "bookmark-folders") {
-				const folders = yield* execJson<BookmarkFolder[]>([
-					...opencliBase,
-					"bookmark-folders",
-					...windowOpts,
-					"-f",
-					"json",
-				])
+				const folders = yield* withRetry(
+					execJson<BookmarkFolder[]>([...base, "bookmark-folders", ...windowOpts, "-f", "json"]),
+					"twitter:discover:folders",
+				)
 
 				if (folders.length === 0) {
-					return yield* Effect.fail(new Error("No bookmark folders found. Are you logged into X in Chrome?"))
+					return yield* Effect.fail(new Error("No bookmark folders found."))
 				}
 
-				// Treat each folder as a discoverable "item" — the user picks one
 				return folders.map((f) => ({
 					id: `folder:${f.id}`,
 					title: `${f.name} (${f.items ?? "?"} items)`,
@@ -102,112 +124,84 @@ class TwitterAdapter implements SourceAdapter {
 				}))
 			}
 
-			// --- Specific bookmark folder ---
+			let tweets: Tweet[]
+
 			if (target.startsWith("folder:")) {
 				const folderId = target.slice("folder:".length)
-				const tweets = yield* execJson<Tweet[]>([
-					...opencliBase,
-					"bookmark-folder",
-					folderId,
-					"--limit",
-					String(config.max),
-					...windowOpts,
-					"-f",
-					"json",
-				])
-				return tweetsToItems(tweets)
-			}
-
-			// --- All bookmarks ---
-			if (target === "all-bookmarks" || target === "saved") {
-				const tweets = yield* execJson<Tweet[]>([
-					...opencliBase,
-					"bookmarks",
-					"--limit",
-					String(config.max),
-					...windowOpts,
-					"-f",
-					"json",
-				])
-				return tweetsToItems(tweets)
-			}
-
-			// --- User tweets ---
-			if (target.startsWith("@") || target.startsWith("tweets:")) {
+				tweets = yield* withRetry(
+					execJson<Tweet[]>([
+						...base,
+						"bookmark-folder",
+						folderId,
+						"--limit",
+						String(config.max),
+						...windowOpts,
+						"-f",
+						"json",
+					]),
+					"twitter:discover:folder",
+				)
+			} else if (target === "all-bookmarks" || target === "saved") {
+				tweets = yield* withRetry(
+					execJson<Tweet[]>([...base, "bookmarks", "--limit", String(config.max), ...windowOpts, "-f", "json"]),
+					"twitter:discover:bookmarks",
+				)
+			} else if (target.startsWith("@") || target.startsWith("tweets:")) {
 				const username = target.startsWith("tweets:") ? target.slice("tweets:".length) : target
-				const tweets = yield* execJson<Tweet[]>([
-					...opencliBase,
-					"tweets",
-					username.replace(/^@/, ""),
-					"--limit",
-					String(config.max),
-					...windowOpts,
-					"-f",
-					"json",
-				])
-				return tweetsToItems(tweets)
-			}
-
-			// --- List timeline ---
-			if (target.startsWith("list:")) {
+				tweets = yield* withRetry(
+					execJson<Tweet[]>([
+						...base,
+						"tweets",
+						username.replace(/^@/, ""),
+						"--limit",
+						String(config.max),
+						...windowOpts,
+						"-f",
+						"json",
+					]),
+					"twitter:discover:tweets",
+				)
+			} else if (target.startsWith("list:")) {
 				const listId = target.slice("list:".length)
-				const tweets = yield* execJson<Tweet[]>([
-					...opencliBase,
-					"list-tweets",
-					listId,
-					"--limit",
-					String(config.max),
-					...windowOpts,
-					"-f",
-					"json",
-				])
-				return tweetsToItems(tweets)
-			}
-
-			// --- Keyword search ---
-			if (target.startsWith("search:")) {
+				tweets = yield* withRetry(
+					execJson<Tweet[]>([
+						...base,
+						"list-tweets",
+						listId,
+						"--limit",
+						String(config.max),
+						...windowOpts,
+						"-f",
+						"json",
+					]),
+					"twitter:discover:list",
+				)
+			} else if (target.startsWith("search:")) {
 				const query = target.slice("search:".length)
-				const tweets = yield* execJson<Tweet[]>([
-					...opencliBase,
-					"search",
-					query,
-					"--limit",
-					String(config.max),
-					...windowOpts,
-					"-f",
-					"json",
-				])
-				return tweetsToItems(tweets)
-			}
-
-			// --- Thread ---
-			if (target.startsWith("thread:")) {
+				tweets = yield* withRetry(
+					execJson<Tweet[]>([...base, "search", query, "--limit", String(config.max), ...windowOpts, "-f", "json"]),
+					"twitter:discover:search",
+				)
+			} else if (target.startsWith("thread:")) {
 				const tweetId = target.slice("thread:".length)
-				const tweets = yield* execJson<Tweet[]>([
-					...opencliBase,
-					"thread",
-					tweetId,
-					"--limit",
-					String(config.max),
-					...windowOpts,
-					"-f",
-					"json",
-				])
-				return tweetsToItems(tweets)
+				tweets = yield* withRetry(
+					execJson<Tweet[]>([...base, "thread", tweetId, "--limit", String(config.max), ...windowOpts, "-f", "json"]),
+					"twitter:discover:thread",
+				)
+			} else {
+				return yield* Effect.fail(
+					new Error(
+						"Unrecognized Twitter target. Use: bookmarks, folder:<id>, all-bookmarks, @username, tweets:username, list:<id>, search:<query>, thread:<id>",
+					),
+				)
 			}
 
-			return yield* Effect.fail(
-				new Error(
-					"Unrecognized Twitter target. Use: bookmarks, folder:<id>, all-bookmarks, @username, tweets:username, list:<id>, search:<query>, thread:<id>",
-				),
-			)
+			return tweetsToItems(tweets)
 		})
 	}
 
 	fetch(item: SourceItem): Effect.Effect<SourceContent, Error> {
 		return Effect.sync(() => {
-			// Twitter items carry their full text in the discover phase,
-			// so fetch just formats them as markdown
 			const meta = item.meta ?? {}
 			const author = String(meta.author ?? "unknown")
 			const createdAt = String(meta.created_at ?? "")

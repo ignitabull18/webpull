@@ -40,7 +40,7 @@
 		}
 	},
 	"files": {
-		"includes": ["src/**", "ui/src/**", "ui/index.html"],
+		"includes": ["src/**", "ui/src/**", "ui/index.html", "test/**"],
 		"maxSize": 2000000
 	}
 }

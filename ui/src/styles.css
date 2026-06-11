@@ -8,6 +8,12 @@
 	--text: #e6e6e6;
 	--text-secondary: #878787;
 	--text-tertiary: #5c5c5c;
+	--subtle: #5c5c5c;
+	--muted: #757575;
+	--fg: #e6e6e6;
+	--bg-alt: #141414;
+	--bg-elevated: #1a1a1a;
+	--bg-hover: #1f1f1f;
 	--accent: #5e6ad2;
 	--accent-hover: #6f7ae0;
 	--accent-muted: rgba(94, 106, 210, 0.12);
@@ -389,7 +395,7 @@ input::placeholder {
 
 .pull-row {
 	display: grid;
-	grid-template-columns: 1fr 80px 80px 90px 32px;
+	grid-template-columns: 48px 1fr 80px 80px 90px 32px;
 	align-items: center;
 	padding: 8px 12px;
 	border-bottom: 1px solid var(--border);
@@ -574,7 +580,6 @@ input::placeholder {
 	display: flex;
 	gap: 8px;
 	padding: 3px 10px;
-	border-bottom: 1px solid var(--border);
 	align-items: baseline;
 	width: 100%;
 	border: none;
@@ -605,7 +610,6 @@ input::placeholder {
 	color: inherit;
 	word-break: break-all;
 }
-
 
 /* ══════════════════════════════════════
    RESULTS
@@ -990,6 +994,381 @@ input::placeholder {
 	}
 }
 
+/* ── Source selector ── */
+.source-selector {
+	display: flex;
+	gap: 2px;
+	margin-bottom: 20px;
+	background: var(--surface);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm);
+	padding: 3px;
+	width: fit-content;
+}
+
+.source-tab {
+	display: flex;
+	align-items: center;
+	gap: 5px;
+	padding: 5px 10px;
+	font-size: 12px;
+	font-weight: 500;
+	font-family: var(--font);
+	color: var(--text-secondary);
+	background: none;
+	border: none;
+	border-radius: 3px;
+	cursor: pointer;
+	transition:
+		background 0.1s,
+		color 0.1s;
+}
+
+.source-tab:hover {
+	background: var(--surface-hover);
+	color: var(--text);
+}
+
+.source-tab.active {
+	background: var(--accent-muted);
+	color: var(--accent);
+}
+
+.source-tab-icon {
+	font-size: 13px;
+}
+
+/* ── Source examples ── */
+.source-examples {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	font-size: 11px;
+	color: var(--text-tertiary);
+	margin-top: -8px;
+	margin-bottom: 16px;
+	flex-wrap: wrap;
+}
+
+.source-example-btn {
+	background: none;
+	border: 1px solid var(--border);
+	border-radius: 3px;
+	padding: 1px 7px;
+	font-size: 11px;
+	font-family: var(--mono);
+	color: var(--text-secondary);
+	cursor: pointer;
+	transition:
+		background 0.1s,
+		color 0.1s;
+}
+
+.source-example-btn:hover {
+	background: var(--surface-hover);
+	color: var(--text);
+}
+
+/* ── Source badge in pull rows ── */
+.source-badge {
+	display: inline-flex;
+	align-items: center;
+	font-size: 9px;
+	font-weight: 600;
+	text-transform: uppercase;
+	letter-spacing: 0.05em;
+	padding: 1px 5px;
+	border-radius: 3px;
+	background: var(--accent-muted);
+	color: var(--accent);
+	white-space: nowrap;
+}
+
+/* ── Source label on pull page ── */
+.pull-source-label {
+	font-size: 10px;
+	font-weight: 600;
+	text-transform: uppercase;
+	letter-spacing: 0.05em;
+	color: var(--accent);
+	background: var(--accent-muted);
+	padding: 2px 8px;
+	border-radius: 3px;
+	margin-bottom: 14px;
+	display: inline-block;
+}
+
+/* ── Source progress line ── */
+.source-progress-line {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	margin-bottom: 10px;
+}
+
+.source-progress-bar-wrap {
+	flex: 1;
+	height: 3px;
+	background: var(--border);
+	border-radius: 2px;
+	overflow: hidden;
+}
+
+.source-progress-count {
+	font-size: 12px;
+	font-weight: 500;
+	color: var(--text-secondary);
+	font-variant-numeric: tabular-nums;
+	min-width: 70px;
+	text-align: right;
+}
+/* ── Source tab status badges ── */
+.source-tab {
+	position: relative;
+}
+.source-tab-status {
+	font-size: 9px;
+	font-weight: 600;
+	padding: 0px 5px;
+	border-radius: 3px;
+	margin-left: 2px;
+	line-height: 1.6;
+}
+
+/* ── Destination selector ── */
+.dest-selector {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	margin-bottom: 16px;
+}
+.dest-label {
+	font-size: 11px;
+	color: var(--text-secondary);
+	font-weight: 500;
+}
+.dest-options {
+	display: flex;
+	gap: 2px;
+	background: var(--surface);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm);
+	padding: 2px;
+}
+.dest-option {
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	padding: 4px 8px;
+	font-size: 12px;
+	font-weight: 500;
+	font-family: var(--font);
+	color: var(--text-secondary);
+	background: none;
+	border: none;
+	border-radius: 3px;
+	cursor: pointer;
+	transition:
+		background 0.1s,
+		color 0.1s;
+}
+.dest-option:hover {
+	background: var(--surface-hover);
+	color: var(--text);
+}
+.dest-option.active {
+	background: var(--accent-muted);
+	color: var(--accent);
+}
+
+/* ── Preview panel ── */
+.preview-panel {
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm);
+	margin-bottom: 16px;
+	overflow: hidden;
+	background: var(--surface);
+}
+.preview-panel-header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding: 8px 12px;
+	border-bottom: 1px solid var(--border);
+	font-size: 12px;
+	font-weight: 500;
+	color: var(--text-secondary);
+}
+.preview-panel-list {
+	max-height: 260px;
+	overflow-y: auto;
+}
+.preview-item {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 6px 12px;
+	border-bottom: 1px solid var(--border);
+	font-size: 12px;
+}
+.preview-item:last-child {
+	border-bottom: none;
+}
+.preview-item-index {
+	width: 6px;
+	height: 6px;
+	border-radius: 50%;
+	background: var(--accent);
+	flex-shrink: 0;
+}
+.preview-item-title {
+	color: var(--text);
+	flex: 1;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.status-pending {
+	background: rgba(255, 200, 0, 0.12);
+	color: #d4a800;
+	border: 1px solid rgba(255, 200, 0, 0.25);
+}
+
+.preview-item-main {
+	flex: 1;
+	min-width: 0;
+}
+
+.preview-item-meta {
+	display: flex;
+	gap: 6px;
+	flex-wrap: wrap;
+	margin-top: 2px;
+}
+
+.preview-item-date {
+	font-size: 10px;
+	color: var(--muted);
+	opacity: 0.6;
+}
+
+.preview-item-size {
+	font-size: 10px;
+	color: var(--muted);
+	opacity: 0.6;
+}
+
+.dest-folder-section {
+	margin-top: 8px;
+	position: relative;
+}
+
+.folder-picker {
+	position: absolute;
+	top: 100%;
+	left: 0;
+	right: 0;
+	z-index: 10;
+	background: var(--bg-elevated);
+	border: 1px solid var(--border);
+	border-radius: 6px;
+	margin-top: 4px;
+	max-height: 240px;
+	overflow-y: auto;
+	box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+}
+
+.folder-picker-header {
+	padding: 6px 10px;
+	font-size: 10px;
+	color: var(--muted);
+	text-transform: uppercase;
+	letter-spacing: 0.05em;
+	border-bottom: 1px solid var(--border);
+}
+
+.folder-picker-item {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	width: 100%;
+	padding: 6px 10px;
+	font-size: 12px;
+	color: var(--text);
+	background: transparent;
+	border: 0;
+	cursor: pointer;
+	text-align: left;
+}
+
+.folder-picker-item:hover {
+	background: var(--bg-hover);
+}
+
+.folder-picker-id {
+	font-size: 10px;
+	color: var(--muted);
+	opacity: 0.5;
+	margin-left: auto;
+	font-family: monospace;
+}
+
+.folder-picker-loading {
+	padding: 8px 10px;
+	font-size: 11px;
+	color: var(--muted);
+	display: flex;
+	align-items: center;
+	gap: 6px;
+}
+
+.preview-item-kind {
+	font-size: 10px;
+	font-weight: 600;
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+	color: var(--text-tertiary);
+	flex-shrink: 0;
+}
+.preview-more {
+	color: var(--text-tertiary);
+	font-style: italic;
+}
+
+/* ── Destination folder input ── */
+.dest-folder-row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	margin-bottom: 12px;
+}
+.dest-folder-input {
+	max-width: 300px;
+	font-size: 12px;
+	padding: 5px 8px;
+}
+.dest-folder-hint {
+	font-size: 11px;
+	color: var(--text-tertiary);
+}
+
+/* ── Destination push button in Pull page ── */
+.push-section {
+	margin-top: 20px;
+	padding-top: 16px;
+	border-top: 1px solid var(--border);
+}
+.push-section-label {
+	font-size: 11px;
+	font-weight: 600;
+	color: var(--text-secondary);
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+	margin-bottom: 8px;
+}
+
+/* ── Responsive ── */
 /* ── Responsive ── */
 @media (max-width: 768px) {
 	.sidebar {
@@ -1065,4 +1444,21 @@ input::placeholder {
 	.pull-table td:nth-child(4) {
 		display: none;
 	}
+}
+
+/* ── Search input (used in project panels) ── */
+.search-input {
+	width: 100%;
+	padding: 5px 8px;
+	font-size: 12px;
+	font-family: var(--font);
+	background: var(--bg);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm);
+	color: var(--text);
+	outline: none;
+}
+.search-input:focus {
+	border-color: var(--accent);
+	box-shadow: 0 0 0 1px var(--accent-muted);
 }

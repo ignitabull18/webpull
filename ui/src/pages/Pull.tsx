@@ -21,6 +21,12 @@ interface TreeNode {
 	doc?: Doc
 }
 
+interface PushResult {
+	ok: number
+	err: number
+	files: { path: string; status: string; error?: string }[]
+}
+
 function buildTree(docs: Doc[]): TreeNode[] {
 	const root: TreeNode[] = []
 	for (const doc of docs) {
@@ -64,6 +70,7 @@ interface ProgressState {
 	elapsed: number
 	status: "discovering" | "running" | "complete" | "error"
 	errorMsg?: string
+	source?: string
 }
 
 export default function Pull() {
@@ -83,6 +90,22 @@ export default function Pull() {
 	const [selectedPath, setSelectedPath] = useState<string | null>(null)
 	const tickRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
+	// Destination push state
+	const [pushing, setPushing] = useState(false)
+	const [pushResult, setPushResult] = useState<PushResult | null>(null)
+	const [pushError, setPushError] = useState("")
+	const destIntent = useRef<any>(null)
+
+	useEffect(() => {
+		// Check for destination intent from sessionStorage
+		try {
+			const stored = sessionStorage.getItem(`webpull-dest-${pullId}`)
+			if (stored) {
+				destIntent.current = JSON.parse(stored)
+			}
+		} catch {}
+	}, [pullId])
+
 	useWebSocket((msg: PullEvent) => {
 		if (msg.pullId !== pullId) return
 		const ev = msg.event
@@ -93,22 +116,28 @@ export default function Pull() {
 					return { ...s, total: ev.urls?.length ?? s.total }
 				case "start": {
 					const wc = ev.workerCount ?? s.workerCount
+					const isSource = !!(ev as any).source
 					return {
 						...s,
 						total: ev.total ?? s.total,
 						workerCount: wc,
-						workerStates: Array(wc).fill("busy") as ("idle" | "busy")[],
+						workerStates: Array(wc).fill(isSource ? "idle" : "busy") as ("idle" | "busy")[],
 						status: "running",
+						source: (ev as any).source || s.source,
 					}
 				}
 				case "progress": {
 					const next = { ...s }
 					next.ok = ev.ok ?? next.ok
 					next.err = ev.err ?? next.err
-					const idx = (next.ok + next.err - 1) % next.workerStates.length
-					if (idx >= 0) {
-						next.workerStates = [...next.workerStates]
-						next.workerStates[idx] = "idle"
+					if ((ev as any).source) {
+						next.workerStates = ["busy"]
+					} else if (next.workerStates.length > 1) {
+						const idx = (next.ok + next.err - 1) % next.workerStates.length
+						if (idx >= 0) {
+							next.workerStates = [...next.workerStates]
+							next.workerStates[idx] = "idle"
+						}
 					}
 					if (ev.status === "ok" && ev.file) {
 						next.recentFiles = [...s.recentFiles.slice(-49), ev.file]
@@ -123,16 +152,24 @@ export default function Pull() {
 							return { ...prev, [ev.file!]: doc }
 						})
 					}
+					next.source = (ev as any).source || next.source
 					return next
 				}
-				case "complete":
-					return {
+				case "complete": {
+					const nextState: ProgressState = {
 						...s,
 						ok: ev.ok ?? s.ok,
 						err: ev.err ?? s.err,
 						status: "complete",
 						workerStates: Array(s.workerCount).fill("idle") as ("idle" | "busy")[],
+						source: (ev as any).source || s.source,
 					}
+					// Auto-push to destination if intent is stored
+					if (s.source && destIntent.current?.destination) {
+						setTimeout(() => handlePush(), 500)
+					}
+					return nextState
+				}
 				case "error":
 					return { ...s, status: "error", errorMsg: ev.message }
 				default:
@@ -142,7 +179,7 @@ export default function Pull() {
 	})
 
 	useEffect(() => {
-		if (state.status === "complete") {
+		if (state.status === "complete" && !destIntent.current?.destination) {
 			const t = setTimeout(() => navigate(`/results/${pullId}`), 1200)
 			return () => clearTimeout(t)
 		}
@@ -158,11 +195,48 @@ export default function Pull() {
 		}
 	}, [state.status])
 
+	const handlePush = async () => {
+		if (!destIntent.current || pushing) return
+		setPushing(true)
+		setPushError("")
+		setPushResult(null)
+
+		try {
+			const res = await fetch("/api/destination/push", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					pullId,
+					destination: destIntent.current.destination,
+					source: destIntent.current.source,
+					target: destIntent.current.destFolder || "root",
+				}),
+			})
+			const data = (await res.json()) as any
+			if (res.ok) {
+				setPushResult(data as PushResult)
+				// Clean up session storage
+				try {
+					sessionStorage.removeItem(`webpull-dest-${pullId}`)
+				} catch {}
+			} else {
+				setPushError(data.error || "Push failed")
+			}
+		} catch (e) {
+			setPushError(String(e))
+		} finally {
+			setPushing(false)
+		}
+	}
+
 	const docs = useMemo(() => Object.values(docMap), [docMap])
 	const tree = useMemo(() => buildTree(docs), [docs])
-	const selectedDoc: Doc | null = selectedPath ? docMap[selectedPath] ?? null : null
+	const selectedDoc: Doc | null = selectedPath ? (docMap[selectedPath] ?? null) : null
+	const workerDots = useMemo(
+		() => state.workerStates.map((status, index) => ({ id: `worker-${index + 1}`, status })),
+		[state.workerStates],
+	)
 
-	// Auto-select first doc when available
 	useEffect(() => {
 		if (!selectedPath && docs.length > 0) {
 			setSelectedPath(docs[0]!.path)
@@ -175,9 +249,11 @@ export default function Pull() {
 
 	const statusLabel =
 		state.status === "discovering"
-			? "Discovering pages…"
+			? "Discovering…"
 			: state.status === "running"
-				? "Pulling…"
+				? state.source
+					? `Pulling ${state.source}…`
+					: "Pulling…"
 				: state.status === "complete"
 					? "Complete"
 					: "Failed"
@@ -201,6 +277,9 @@ export default function Pull() {
 		))
 	}
 
+	const isSource = !!state.source
+	const showPush = isSource && state.status === "complete" && (destIntent.current?.destination || pushResult)
+
 	return (
 		<div className="pull-shell">
 			{/* ── Left panel: progress ── */}
@@ -216,17 +295,34 @@ export default function Pull() {
 					<h1>{statusLabel}</h1>
 				</div>
 
+				{state.source && <div className="pull-source-label">{state.source} source</div>}
+
 				{state.errorMsg && <div className="error-msg">{state.errorMsg}</div>}
 
-				<div className="worker-strip">
-					{state.workerStates.map((s, _i) => (
-						<div key={`w-${_i}`} className={`worker-dot ${s}`} />
-					))}
-				</div>
+				{!isSource && (
+					<div className="worker-strip">
+						{workerDots.map((worker) => (
+							<div key={worker.id} className={`worker-dot ${worker.status}`} />
+						))}
+					</div>
+				)}
 
-				<div className="progress-bar-wrap">
-					<div className="progress-bar-fill" style={{ width: `${pct}%` }} />
-				</div>
+				{isSource && state.status === "running" && (
+					<div className="source-progress-line">
+						<div className="source-progress-bar-wrap">
+							<div className="progress-bar-fill" style={{ width: `${pct}%` }} />
+						</div>
+						<span className="source-progress-count">
+							{state.ok + state.err} / {state.total || "—"}
+						</span>
+					</div>
+				)}
+
+				{!isSource && (
+					<div className="progress-bar-wrap">
+						<div className="progress-bar-fill" style={{ width: `${pct}%` }} />
+					</div>
+				)}
 
 				<div className="progress-stats">
 					<span>
@@ -267,9 +363,61 @@ export default function Pull() {
 					</div>
 				)}
 
+				{/* Destination push section */}
+				{showPush && (
+					<div className="push-section">
+						<div className="push-section-label">{pushResult ? "Push result" : "Push to Google Drive"}</div>
+
+						{pushResult ? (
+							<div>
+								<div style={{ marginBottom: "8px" }}>
+									<span className="status-badge status-complete" style={{ marginRight: "6px" }}>
+										✓ {pushResult.ok} ok
+									</span>
+									{pushResult.err > 0 && <span className="status-badge status-failed">✕ {pushResult.err} err</span>}
+								</div>
+								{pushResult.files
+									.filter((f) => f.status === "err")
+									.slice(0, 5)
+									.map((f) => (
+										<div key={f.path} className="error-msg" style={{ marginBottom: "4px", fontSize: "11px" }}>
+											{f.path}: {f.error ?? "unknown"}
+										</div>
+									))}
+							</div>
+						) : (
+							<button type="button" className="btn btn-secondary" onClick={handlePush} disabled={pushing}>
+								{pushing ? <span className="spinner" /> : "Push to Drive"}
+							</button>
+						)}
+
+						{pushError && (
+							<div className="error-msg" style={{ marginTop: "8px" }}>
+								{pushError}
+							</div>
+						)}
+					</div>
+				)}
+
 				{state.status === "error" && (
-					<button type="button" className="btn btn-secondary" style={{ marginTop: "20px" }} onClick={() => navigate("/")}>
+					<button
+						type="button"
+						className="btn btn-secondary"
+						style={{ marginTop: "20px" }}
+						onClick={() => navigate("/")}
+					>
 						← Back
+					</button>
+				)}
+
+				{state.status === "complete" && (
+					<button
+						type="button"
+						className="btn btn-secondary"
+						style={{ marginTop: "20px" }}
+						onClick={() => navigate(`/results/${pullId}`)}
+					>
+						View results →
 					</button>
 				)}
 			</div>

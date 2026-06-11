@@ -1,32 +1,37 @@
-import { join } from "node:path"
+import { mkdirSync } from "node:fs"
+import { join, resolve } from "node:path"
 import { Effect } from "effect"
-import type { SourceAdapter, SourceConfig, SourceContent, SourceItem } from "./types"
+import { withRetry } from "./retry"
+import type { SourceAdapter, SourceConfig, SourceContent, SourceItem, SourceStatus } from "./types"
 
-function exec(cmd: string[], opts?: { stdin?: string }): Effect.Effect<string, Error> {
-	return Effect.tryPromise({
-		try: async () => {
-			const spawnOpts: any = { stdout: "pipe", stderr: "pipe" }
-			if (opts?.stdin) spawnOpts.stdin = Buffer.from(opts.stdin)
-			const proc = Bun.spawnSync(cmd, spawnOpts)
-			if (proc.exitCode !== 0) {
-				const errText = new TextDecoder().decode(proc.stderr)
-				throw new Error(`gws exited ${proc.exitCode}: ${errText.trimEnd()}`)
-			}
-			return new TextDecoder().decode(proc.stdout)
-		},
-		catch: (e) => new Error(`Failed to run gws: ${e}`),
-	})
+const EXEC_TIMEOUT = 30_000
+
+async function execAsync(cmd: string[], opts?: { stdin?: string }): Promise<string> {
+	const spawnOpts: any = { stdout: "pipe", stderr: "pipe" }
+	if (opts?.stdin) spawnOpts.stdin = Buffer.from(opts.stdin)
+	const proc = Bun.spawn(cmd, spawnOpts)
+	const timeout = setTimeout(() => proc.kill(), EXEC_TIMEOUT)
+	try {
+		const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()])
+		const exitCode = await proc.exited
+		if (exitCode !== 0) {
+			const reason = proc.killed ? "timed out" : `exited ${exitCode}`
+			throw new Error(`gws ${reason}: ${stderr.trimEnd()}`)
+		}
+		return stdout
+	} finally {
+		clearTimeout(timeout)
+	}
 }
 
 function execJson<T>(cmd: string[], opts?: { stdin?: string }): Effect.Effect<T, Error> {
-	return exec(cmd, opts).pipe(
-		Effect.flatMap((out) =>
-			Effect.try({
-				try: () => JSON.parse(out.trim() || "[]") as T,
-				catch: (e) => new Error(`JSON parse: ${e}`),
-			}),
-		),
-	)
+	return Effect.tryPromise({
+		try: async () => {
+			const out = await execAsync(cmd, opts)
+			return JSON.parse(out.trim() || "[]") as T
+		},
+		catch: (e) => new Error(`Failed to run gws: ${e}`),
+	})
 }
 
 interface GDriveFile {
@@ -62,19 +67,42 @@ const EXTENSION_MAP: Record<string, string> = {
 	[SLIDES_MIME]: ".txt",
 }
 
-/**
- * Google Drive source adapter.
- *
- * Supports:
- * - Folder IDs: discovers all files in a folder (recursive, max depth 3)
- * - File IDs: discovers a single file
- * - Root: discovers files in "My Drive" root
- * - Query: raw Drive API query string
- *
- * Uses `gws drive` under the hood. Requires OAuth via `gws auth login`.
- */
 class GDriveAdapter implements SourceAdapter {
 	readonly name = "Google Drive"
+
+	checkStatus(): Effect.Effect<SourceStatus, Error> {
+		return Effect.gen(this, function* () {
+			const which = Bun.spawnSync(["which", "gws"], { stdout: "pipe", stderr: "pipe" })
+			const installed = which.exitCode === 0
+			if (!installed) {
+				return { installed: false, authenticated: false, message: "gws not installed. Run: npm i -g @ignitabull/gws" }
+			}
+
+			// Use async exec for the actual check
+			const checkResult = yield* Effect.either(
+				execJson<unknown>([
+					"gws",
+					"drive",
+					"files",
+					"list",
+					"--params",
+					JSON.stringify({ pageSize: 1 }),
+					"--format",
+					"json",
+				]),
+			)
+
+			if (checkResult._tag === "Right") {
+				return { installed: true, authenticated: true, message: "Ready — Drive OAuth configured" }
+			}
+
+			const errMsg = String(checkResult.left).toLowerCase()
+			if (errMsg.includes("auth") || errMsg.includes("login") || errMsg.includes("401") || errMsg.includes("403")) {
+				return { installed: true, authenticated: false, message: "Not authenticated — run: gws auth login" }
+			}
+			return { installed: true, authenticated: false, message: "Drive API may not be accessible" }
+		})
+	}
 
 	discover(config: SourceConfig): Effect.Effect<SourceItem[], Error> {
 		return Effect.gen(this, function* () {
@@ -90,24 +118,23 @@ class GDriveAdapter implements SourceAdapter {
 			} else if (target.startsWith("query:")) {
 				query = target.slice("query:".length)
 			} else if (target.startsWith("file:")) {
-				// Single file — use files.get
 				const fileId = target.slice("file:".length)
-				const data = yield* execJson<GDriveFile>([
-					"gws",
-					"drive",
-					"files",
-					"get",
-					"--params",
-					JSON.stringify({ fileId }),
-					"-f",
-					"json",
-				])
-
-				// gws wraps in a data property
+				const data = yield* withRetry(
+					execJson<GDriveFile>([
+						"gws",
+						"drive",
+						"files",
+						"get",
+						"--params",
+						JSON.stringify({ fileId }),
+						"--format",
+						"json",
+					]),
+					"gdrive:discover:single",
+				)
 				const file: GDriveFile = (data as any).data ?? data
 				return [fileToItem(file)]
 			} else if (/^[a-zA-Z0-9_-]{25,}$/.test(target)) {
-				// Try as folder ID first
 				query = `'${target}' in parents and trashed = false`
 			} else {
 				return yield* Effect.fail(
@@ -131,21 +158,24 @@ class GDriveAdapter implements SourceAdapter {
 				}
 				if (pageToken) params.pageToken = pageToken
 
-				const response = yield* execJson<{ data?: GDriveListResponse } & GDriveListResponse>([
-					"gws",
-					"drive",
-					"files",
-					"list",
-					"--params",
-					JSON.stringify(params),
-					"-f",
-					"json",
-				])
+				const response = yield* withRetry(
+					execJson<{ data?: GDriveListResponse } & GDriveListResponse>([
+						"gws",
+						"drive",
+						"files",
+						"list",
+						"--params",
+						JSON.stringify(params),
+						"--format",
+						"json",
+					]),
+					"gdrive:discover:list",
+				)
 
 				const data: GDriveListResponse = (response as any).data ?? response
 				const files = data.files ?? []
 				for (const f of files) {
-					if (f.mimeType === FOLDER_MIME) continue // Skip folders in listing
+					if (f.mimeType === FOLDER_MIME) continue
 					items.push(fileToItem(f))
 				}
 				pageToken = data.nextPageToken
@@ -165,30 +195,34 @@ class GDriveAdapter implements SourceAdapter {
 			const mimeType = String(item.meta?.mimeType ?? "")
 			const fileName = item.title
 
-			// Google Workspace files (Docs/Sheets/Slides) need export
 			if (mimeType in EXPORT_MIME_MAP) {
 				const exportMime = EXPORT_MIME_MAP[mimeType]!
 				const ext = EXTENSION_MAP[mimeType]!
-				const outPath = join("/tmp", `webpull-gdrive-${fileId}${ext}`)
+				const outDir = join(resolve(import.meta.dir, ".."), ".tmp-gdrive")
+				try {
+					mkdirSync(outDir, { recursive: true })
+				} catch {}
+				const outPath = join(outDir, `webpull-gdrive-${fileId}${ext}`)
 
-				// First try the export
 				const exportResult = yield* Effect.either(
-					exec([
-						"gws",
-						"drive",
-						"files",
-						"export",
-						"--params",
-						JSON.stringify({ fileId, mimeType: exportMime }),
-						"-o",
-						outPath,
-						"-f",
-						"json",
-					]),
+					withRetry(
+						execJson<unknown>([
+							"gws",
+							"drive",
+							"files",
+							"export",
+							"--params",
+							JSON.stringify({ fileId, mimeType: exportMime }),
+							"-o",
+							outPath,
+							"--format",
+							"json",
+						]),
+						"gdrive:fetch:export",
+					),
 				)
 
 				if (exportResult._tag === "Right") {
-					// Read the exported file
 					const contentResult = yield* Effect.either(
 						Effect.tryPromise({
 							try: async () => {
@@ -200,7 +234,6 @@ class GDriveAdapter implements SourceAdapter {
 						}),
 					)
 
-					// Clean up temp file
 					try {
 						Bun.spawnSync(["rm", "-f", outPath])
 					} catch {}
@@ -215,7 +248,6 @@ class GDriveAdapter implements SourceAdapter {
 				}
 			}
 
-			// Non-Google files or export failures — grab metadata only
 			const markdown =
 				`---\ntitle: "${fileName.replace(/"/g, '\\"')}"\nurl: "${item.url}"\nfile_id: "${fileId}"\nmime_type: "${mimeType}"\n---\n\n` +
 				`# ${fileName}\n\n_Drive file: ${mimeType}_`

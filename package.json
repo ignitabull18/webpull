@@ -7,6 +7,16 @@
 	"bin": {
 		"webpull": "bin/webpull"
 	},
+	"files": [
+		"bin",
+		"scripts/daemon.ts",
+		"src",
+		"!src/.tmp-*",
+		"ui/index.html",
+		"ui/src",
+		"ui/dist",
+		"!ui/dist/*.map"
+	],
 	"devDependencies": {
 		"@biomejs/biome": "^2.4.13",
 		"@types/bun": "latest",
@@ -19,6 +29,8 @@
 		"typescript": "^5"
 	},
 	"dependencies": {
+		"@modelcontextprotocol/ext-apps": "^1.7.4",
+		"@modelcontextprotocol/sdk": "^1.29.0",
 		"defuddle": "^0.18.1",
 		"effect": "^3.21.2",
 		"linkedom": "^0.18.12",
@@ -28,9 +40,25 @@
 		"react-markdown": "^10.1.0",
 		"react-router-dom": "^7.17.0",
 		"react-syntax-highlighter": "^16.1.1",
-		"remark-gfm": "^4.0.1"
+		"remark-gfm": "^4.0.1",
+		"zod": "^4.4.3"
 	},
 	"scripts": {
-		"build:ui": "bun build ui/src/main.tsx --outdir ui/dist --target browser"
+		"build:ui": "bun build ui/src/main.tsx --outdir ui/dist --target browser",
+		"prepack": "bun run build:ui",
+		"start": "bun run src/index.ts",
+		"server:start": "bun run scripts/daemon.ts",
+		"server:stop": "pkill -f 'bun run src/index.ts --server' 2>/dev/null; echo 'Server stopped'",
+		"server:status": "curl --max-time 5 -s -o /dev/null -w '%{http_code}' http://localhost:${WEBPULL_PORT:-3456}/ 2>/dev/null || echo 'down'",
+		"test:api": "bun run test/api.ts",
+		"test:cli": "bun run test/cli.ts",
+		"test:db": "bun run test/db.ts",
+		"test:e2e": "bun run test/e2e.ts",
+		"test:mcp": "bun run test/mcp.ts",
+		"test:pack": "bun run test/pack.ts",
+		"test:packed-runtime": "bun run test/packed-runtime.ts",
+		"test:smoke": "bun run test/smoke.ts",
+		"test:smoke:existing": "bun run test:e2e && bun run test:mcp",
+		"dev": "WEBPULL_WATCH=1 bun run start"
 	}
 }

@@ -1,11 +1,13 @@
 import { Route, Routes, useLocation, useNavigate } from "react-router-dom"
 import History from "./pages/History"
 import Home from "./pages/Home"
+import Projects from "./pages/Projects"
 import Pull from "./pages/Pull"
 import Results from "./pages/Results"
 
 const NAV_ITEMS = [
 	{ path: "/", label: "Pull", icon: "↓" },
+	{ path: "/projects", label: "Projects", icon: "📁" },
 	{ path: "/history", label: "History", icon: "☰" },
 ]
 
@@ -25,7 +27,7 @@ export default function App() {
 						<button
 							type="button"
 							key={item.path}
-							className={`sidebar-btn ${location.pathname === item.path || (item.path === "/" && location.pathname.startsWith("/pull")) ? "active" : ""}`}
+							className={`sidebar-btn ${location.pathname === item.path || (item.path === "/" && location.pathname.startsWith("/pull")) || (item.path === "/projects" && location.pathname.startsWith("/projects")) ? "active" : ""}`}
 							onClick={() => navigate(item.path)}
 						>
 							<span className="sidebar-icon">{item.icon}</span>
@@ -40,6 +42,7 @@ export default function App() {
 					<Route path="/pull/:pullId" element={<Pull />} />
 					<Route path="/results/:pullId" element={<Results />} />
 					<Route path="/history" element={<History />} />
+					<Route path="/projects" element={<Projects />} />
 				</Routes>
 			</main>
 		</div>

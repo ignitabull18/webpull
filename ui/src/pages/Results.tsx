@@ -83,6 +83,9 @@ export default function Results() {
 	const [searchQuery, setSearchQuery] = useState("")
 	const [searchResults, setSearchResults] = useState<SearchResult[] | null>(null)
 	const [loading, setLoading] = useState(true)
+	const [pushing, setPushing] = useState(false)
+	const [pushError, setPushError] = useState("")
+	const [pushOk, setPushOk] = useState(false)
 
 	useEffect(() => {
 		async function load() {
@@ -150,6 +153,29 @@ export default function Results() {
 		)
 	}
 
+	const handlePushToDrive = async () => {
+		setPushing(true)
+		setPushError("")
+		setPushOk(false)
+		try {
+			const res = await fetch("/api/destination/push", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ pullId, destination: "gdrive", target: "root" }),
+			})
+			const data = (await res.json()) as any
+			if (res.ok && data.ok > 0) {
+				setPushOk(true)
+			} else {
+				setPushError(data.error || data.files?.[0]?.error || "Push failed")
+			}
+		} catch (e) {
+			setPushError(String(e))
+		} finally {
+			setPushing(false)
+		}
+	}
+
 	const hostname = pull?.url
 		? (() => {
 				try {
@@ -177,6 +203,17 @@ export default function Results() {
 							}}
 						>
 							Download ZIP
+						</button>
+					)}
+					{pull?.status === "complete" && (
+						<button
+							type="button"
+							className="btn btn-ghost btn-small"
+							onClick={handlePushToDrive}
+							disabled={pushing || pushOk}
+							title="Push all files to Google Drive"
+						>
+							{pushing ? <span className="spinner" /> : pushOk ? "✓ Pushed" : "Push to Drive"}
 						</button>
 					)}
 				</div>
@@ -221,6 +258,11 @@ export default function Results() {
 					)}
 				</div>
 				<div className="results-sidebar-footer">
+					{pushError && (
+						<div className="error-msg" style={{ marginBottom: "6px", fontSize: "11px" }}>
+							{pushError}
+						</div>
+					)}
 					<button type="button" className="btn btn-ghost btn-small" onClick={() => navigate("/")}>
 						← Back to pulls
 					</button>

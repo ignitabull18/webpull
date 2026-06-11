@@ -1,0 +1,814 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width,initial-scale=1" />
+		<title>webpull</title>
+		<style>
+			:root {
+				color-scheme: dark;
+				--bg: #0d0d0f;
+				--surface: #141519;
+				--surface-2: #1a1c22;
+				--surface-3: #22252d;
+				--border: #2b2f3a;
+				--border-soft: #20232b;
+				--text: #f1f3f7;
+				--muted: #a2a9b8;
+				--subtle: #6f788a;
+				--accent: #6574e8;
+				--accent-2: #8fa4ff;
+				--green: #46c889;
+				--yellow: #d9aa3f;
+				--red: #ee6c72;
+				font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+			}
+
+			* {
+				box-sizing: border-box;
+			}
+
+			html,
+			body {
+				margin: 0;
+				min-height: 100%;
+				background: var(--bg);
+				color: var(--text);
+			}
+
+			body {
+				font-size: 13px;
+				line-height: 1.45;
+				-webkit-font-smoothing: antialiased;
+			}
+
+			button,
+			input {
+				font: inherit;
+			}
+
+			button {
+				border: 1px solid var(--border);
+				background: var(--surface-2);
+				color: var(--text);
+				border-radius: 6px;
+				cursor: pointer;
+			}
+
+			button:hover:not(:disabled) {
+				background: var(--surface-3);
+			}
+
+			button:disabled {
+				cursor: not-allowed;
+				opacity: 0.55;
+			}
+
+			input {
+				width: 100%;
+				min-width: 0;
+				border: 1px solid var(--border);
+				background: #0f1014;
+				color: var(--text);
+				border-radius: 6px;
+				padding: 8px 10px;
+				outline: none;
+			}
+
+			input:focus {
+				border-color: var(--accent);
+				box-shadow: 0 0 0 1px rgba(101, 116, 232, 0.22);
+			}
+
+			label {
+				display: grid;
+				gap: 5px;
+				color: var(--muted);
+				font-size: 11px;
+				font-weight: 650;
+				text-transform: uppercase;
+			}
+
+			.shell {
+				display: grid;
+				grid-template-rows: auto auto minmax(0, 1fr);
+				min-height: 100vh;
+			}
+
+			.topbar {
+				display: flex;
+				align-items: center;
+				justify-content: space-between;
+				gap: 14px;
+				padding: 14px 16px 12px;
+				border-bottom: 1px solid var(--border-soft);
+				background: #101115;
+			}
+
+			.brand {
+				display: flex;
+				align-items: center;
+				gap: 9px;
+				min-width: 0;
+			}
+
+			.mark {
+				width: 9px;
+				height: 9px;
+				border-radius: 50%;
+				background: var(--accent);
+				box-shadow: 0 0 18px rgba(101, 116, 232, 0.75);
+				flex: 0 0 auto;
+			}
+
+			h1 {
+				margin: 0;
+				font-size: 15px;
+				line-height: 1.1;
+			}
+
+			.subtitle {
+				margin: 2px 0 0;
+				color: var(--muted);
+				font-size: 12px;
+			}
+
+			.status {
+				display: inline-flex;
+				align-items: center;
+				gap: 6px;
+				border: 1px solid var(--border);
+				background: var(--surface);
+				border-radius: 999px;
+				padding: 5px 9px;
+				color: var(--muted);
+				font-size: 11px;
+				white-space: nowrap;
+			}
+
+			.status.running {
+				color: var(--yellow);
+			}
+
+			.status.complete,
+			.status.ready {
+				color: var(--green);
+			}
+
+			.status.failed {
+				color: var(--red);
+			}
+
+			.tabs {
+				display: flex;
+				gap: 3px;
+				padding: 8px;
+				border-bottom: 1px solid var(--border-soft);
+				background: var(--surface);
+			}
+
+			.tab {
+				padding: 7px 10px;
+				border: 0;
+				background: transparent;
+				color: var(--muted);
+			}
+
+			.tab.active {
+				background: var(--surface-3);
+				color: var(--text);
+			}
+
+			.workspace {
+				display: grid;
+				grid-template-columns: 260px minmax(0, 1fr);
+				min-height: 480px;
+			}
+
+			.sidebar {
+				border-right: 1px solid var(--border-soft);
+				background: var(--surface);
+				min-width: 0;
+			}
+
+			.panel-head {
+				display: flex;
+				align-items: center;
+				justify-content: space-between;
+				gap: 8px;
+				padding: 10px 12px;
+				border-bottom: 1px solid var(--border-soft);
+				color: var(--muted);
+				font-size: 11px;
+				font-weight: 700;
+				text-transform: uppercase;
+			}
+
+			.icon-btn {
+				width: 28px;
+				height: 28px;
+				display: inline-grid;
+				place-items: center;
+				padding: 0;
+				font-size: 14px;
+			}
+
+			.pull-list,
+			.doc-list {
+				display: grid;
+				max-height: 540px;
+				overflow: auto;
+			}
+
+			.list-item {
+				display: grid;
+				gap: 4px;
+				width: 100%;
+				padding: 10px 12px;
+				border: 0;
+				border-bottom: 1px solid var(--border-soft);
+				border-radius: 0;
+				background: transparent;
+				text-align: left;
+			}
+
+			.list-item.active,
+			.list-item:hover {
+				background: var(--surface-2);
+			}
+
+			.item-title {
+				overflow: hidden;
+				text-overflow: ellipsis;
+				white-space: nowrap;
+				font-weight: 650;
+			}
+
+			.item-meta {
+				overflow: hidden;
+				text-overflow: ellipsis;
+				white-space: nowrap;
+				color: var(--subtle);
+				font-size: 11px;
+			}
+
+			.content {
+				display: grid;
+				grid-template-rows: auto minmax(0, 1fr);
+				min-width: 0;
+				background: var(--bg);
+			}
+
+			.view {
+				display: none;
+				min-width: 0;
+			}
+
+			.view.active {
+				display: grid;
+				grid-template-rows: auto minmax(0, 1fr);
+			}
+
+			.form-grid {
+				display: grid;
+				grid-template-columns: minmax(0, 1fr) 110px 96px;
+				gap: 10px;
+				padding: 14px;
+				border-bottom: 1px solid var(--border-soft);
+			}
+
+			.actions {
+				display: flex;
+				align-items: end;
+				gap: 8px;
+			}
+
+			.primary {
+				background: var(--accent);
+				border-color: var(--accent);
+				color: #fff;
+				font-weight: 700;
+				padding: 8px 12px;
+			}
+
+			.secondary {
+				padding: 8px 10px;
+			}
+
+			.dashboard {
+				display: grid;
+				grid-template-columns: repeat(4, minmax(0, 1fr));
+				gap: 10px;
+				padding: 14px;
+			}
+
+			.metric {
+				border: 1px solid var(--border);
+				background: var(--surface);
+				border-radius: 8px;
+				padding: 12px;
+			}
+
+			.metric-value {
+				font-size: 22px;
+				font-weight: 750;
+			}
+
+			.metric-label {
+				margin-top: 2px;
+				color: var(--muted);
+				font-size: 11px;
+			}
+
+			.search-bar {
+				display: grid;
+				grid-template-columns: minmax(0, 1fr) auto;
+				gap: 8px;
+				padding: 12px;
+				border-bottom: 1px solid var(--border-soft);
+			}
+
+			.results-layout {
+				display: grid;
+				grid-template-columns: 300px minmax(0, 1fr);
+				min-height: 420px;
+			}
+
+			.preview {
+				min-width: 0;
+				border-left: 1px solid var(--border-soft);
+				background: #0f1014;
+			}
+
+			.preview-head {
+				padding: 12px 14px;
+				border-bottom: 1px solid var(--border-soft);
+			}
+
+			.preview-title {
+				font-weight: 750;
+				overflow: hidden;
+				text-overflow: ellipsis;
+				white-space: nowrap;
+			}
+
+			.preview-url {
+				margin-top: 3px;
+				color: var(--subtle);
+				font-size: 11px;
+				overflow: hidden;
+				text-overflow: ellipsis;
+				white-space: nowrap;
+			}
+
+			.markdown {
+				max-height: 470px;
+				overflow: auto;
+				padding: 16px;
+				white-space: pre-wrap;
+				font-family: ui-monospace, "SF Mono", Menlo, monospace;
+				font-size: 12px;
+				line-height: 1.6;
+				color: #e6e9f1;
+			}
+
+			.empty {
+				padding: 24px;
+				color: var(--muted);
+			}
+
+			.help {
+				display: grid;
+				gap: 10px;
+				padding: 14px;
+			}
+
+			.help-row {
+				border: 1px solid var(--border);
+				background: var(--surface);
+				border-radius: 8px;
+				padding: 12px;
+			}
+
+			.help-row strong {
+				display: block;
+				margin-bottom: 4px;
+			}
+
+			@media (max-width: 760px) {
+				.workspace,
+				.results-layout {
+					grid-template-columns: 1fr;
+				}
+
+				.sidebar,
+				.preview {
+					border: 0;
+				}
+
+				.form-grid,
+				.dashboard {
+					grid-template-columns: 1fr;
+				}
+			}
+		</style>
+	</head>
+	<body>
+		<main class="shell">
+			<header class="topbar">
+				<div class="brand">
+					<span class="mark"></span>
+					<div>
+						<h1>webpull</h1>
+						<p class="subtitle">Pull public docs into markdown, search them, and preview exact files.</p>
+					</div>
+				</div>
+				<span id="status" class="status ready">Ready</span>
+			</header>
+
+			<nav class="tabs" aria-label="webpull views">
+				<button class="tab active" type="button" data-tab="pull">Pull</button>
+				<button class="tab" type="button" data-tab="results">Results</button>
+				<button class="tab" type="button" data-tab="help">Guide</button>
+			</nav>
+
+			<section class="workspace">
+				<aside class="sidebar">
+					<div class="panel-head">
+						<span>Recent pulls</span>
+						<button id="refresh" class="icon-btn" type="button" title="Refresh pulls">R</button>
+					</div>
+					<div id="pulls" class="pull-list">
+						<div class="empty">No pulls loaded yet.</div>
+					</div>
+				</aside>
+
+				<section class="content">
+					<section id="pull-view" class="view active">
+						<form id="pull-form" class="form-grid">
+							<label>
+								Docs URL
+								<input id="url" type="url" placeholder="https://docs.example.com" />
+							</label>
+							<label>
+								Max pages
+								<input id="max-pages" type="number" min="1" max="1000" value="100" />
+							</label>
+							<div class="actions">
+								<button class="primary" type="submit">Start</button>
+							</div>
+						</form>
+						<div class="dashboard">
+							<div class="metric">
+								<div id="metric-status" class="metric-value">Idle</div>
+								<div class="metric-label">Current status</div>
+							</div>
+							<div class="metric">
+								<div id="metric-ok" class="metric-value">0</div>
+								<div class="metric-label">Pages pulled</div>
+							</div>
+							<div class="metric">
+								<div id="metric-err" class="metric-value">0</div>
+								<div class="metric-label">Errors</div>
+							</div>
+							<div class="metric">
+								<div id="metric-docs" class="metric-value">0</div>
+								<div class="metric-label">Visible docs</div>
+							</div>
+						</div>
+					</section>
+
+					<section id="results-view" class="view">
+						<div class="search-bar">
+							<input id="query" type="search" placeholder="Search pulled markdown..." />
+							<button id="search" class="secondary" type="button">Search</button>
+						</div>
+						<div class="results-layout">
+							<div id="docs" class="doc-list">
+								<div class="empty">Choose a pull or run a search.</div>
+							</div>
+							<div class="preview">
+								<div class="preview-head">
+									<div id="preview-title" class="preview-title">Preview</div>
+									<div id="preview-url" class="preview-url">Select a document to inspect its markdown.</div>
+								</div>
+								<div id="preview" class="markdown">No document selected.</div>
+							</div>
+						</div>
+					</section>
+
+					<section id="help-view" class="view">
+						<div class="help">
+							<div class="help-row">
+								<strong>Pull a docs site</strong>
+								Enter a public documentation URL, choose a page limit, and start the pull. The pull continues in the server.
+							</div>
+							<div class="help-row">
+								<strong>Search and preview</strong>
+								Open a completed pull, search across all markdown or within the selected pull, then fetch exact files.
+							</div>
+							<div class="help-row">
+								<strong>Ask ChatGPT</strong>
+								You can also ask ChatGPT to call webpull tools directly, then this widget updates from the tool result.
+							</div>
+						</div>
+					</section>
+				</section>
+			</section>
+		</main>
+
+		<script>
+			const state = {
+				pulls: [],
+				results: [],
+				document: null,
+				selectedPullId: null,
+				selectedDocId: null,
+				activeTab: "pull",
+				requestId: 1,
+				pending: new Map(),
+				pollTimer: null,
+			}
+
+			const els = {
+				status: document.getElementById("status"),
+				pulls: document.getElementById("pulls"),
+				docs: document.getElementById("docs"),
+				preview: document.getElementById("preview"),
+				previewTitle: document.getElementById("preview-title"),
+				previewUrl: document.getElementById("preview-url"),
+				url: document.getElementById("url"),
+				maxPages: document.getElementById("max-pages"),
+				query: document.getElementById("query"),
+				search: document.getElementById("search"),
+				form: document.getElementById("pull-form"),
+				refresh: document.getElementById("refresh"),
+				metricStatus: document.getElementById("metric-status"),
+				metricOk: document.getElementById("metric-ok"),
+				metricErr: document.getElementById("metric-err"),
+				metricDocs: document.getElementById("metric-docs"),
+			}
+
+			function setStatus(text, cls) {
+				els.status.className = `status ${cls || "ready"}`
+				els.status.textContent = text
+			}
+
+			function setTab(tab) {
+				state.activeTab = tab
+				document.querySelectorAll(".tab").forEach((button) => {
+					button.classList.toggle("active", button.dataset.tab === tab)
+				})
+				document.querySelectorAll(".view").forEach((view) => {
+					view.classList.toggle("active", view.id === `${tab}-view`)
+				})
+			}
+
+			function sendRpc(method, params) {
+				const id = state.requestId++
+				window.parent.postMessage({ jsonrpc: "2.0", id, method, params }, "*")
+				return new Promise((resolve, reject) => {
+					state.pending.set(id, { resolve, reject })
+					setTimeout(() => {
+						if (!state.pending.has(id)) return
+						state.pending.delete(id)
+						reject(new Error("The host did not respond to the tool call."))
+					}, 45000)
+				})
+			}
+
+			async function callTool(name, argumentsValue) {
+				if (window.openai?.callTool) {
+					const result = await window.openai.callTool(name, argumentsValue || {})
+					return result?.structuredContent ? result.structuredContent : result
+				}
+				const result = await sendRpc("tools/call", { name, arguments: argumentsValue || {} })
+				return result?.structuredContent ? result.structuredContent : result
+			}
+
+			function hydrate(data) {
+				if (!data) return
+				if (Array.isArray(data.pulls)) {
+					state.pulls = data.pulls
+				}
+				if (data.pull) {
+					upsertPull(data.pull)
+					state.selectedPullId = data.pull.id
+					renderMetrics(data.pull, Array.isArray(data.results) ? data.results.length : state.results.length)
+					if (data.pull.status === "running") startPolling(data.pull.id)
+				}
+				if (data.selectedPullId) state.selectedPullId = data.selectedPullId
+				if (Array.isArray(data.results)) {
+					state.results = data.results
+				}
+				if (data.document) {
+					state.document = data.document
+					state.selectedDocId = data.document.id
+				}
+				renderPulls()
+				renderDocs()
+				renderDocument()
+			}
+
+			function upsertPull(pull) {
+				const index = state.pulls.findIndex((item) => item.id === pull.id)
+				if (index === -1) state.pulls = [pull].concat(state.pulls)
+				else state.pulls[index] = pull
+			}
+
+			function renderPulls() {
+				if (!state.pulls.length) {
+					els.pulls.innerHTML = '<div class="empty">No pulls loaded yet.</div>'
+					renderMetrics(null, state.results.length)
+					return
+				}
+				els.pulls.innerHTML = state.pulls.map((pull) => {
+					const selected = pull.id === state.selectedPullId ? " active" : ""
+					const statusClass = pull.status || ""
+					const count = `${String(pull.pagesOk || 0)} ok / ${String(pull.pagesErr || 0)} err`
+					return [
+						`<button class="list-item${selected}" data-pull-id="${escapeHtml(pull.id)}">`,
+						`<span class="item-title">${escapeHtml(hostname(pull.url))}</span>`,
+						`<span class="item-meta">${escapeHtml(count)} · <span class="${escapeHtml(statusClass)}">${escapeHtml(pull.status)}</span></span>`,
+						`<span class="item-meta">${escapeHtml(pull.url)}</span>`,
+						"</button>",
+					].join("")
+				}).join("")
+				const selectedPull = state.pulls.find((pull) => pull.id === state.selectedPullId) || null
+				renderMetrics(selectedPull, state.results.length)
+			}
+
+			function renderDocs() {
+				if (!state.results.length) {
+					els.docs.innerHTML = '<div class="empty">Choose a pull or run a search.</div>'
+					return
+				}
+				els.docs.innerHTML = state.results.map((doc) => {
+					const selected = doc.id === state.selectedDocId ? " active" : ""
+					return [
+						`<button class="list-item${selected}" data-doc-id="${escapeHtml(doc.id)}">`,
+						`<span class="item-title">${escapeHtml(doc.title || doc.path)}</span>`,
+						`<span class="item-meta">${escapeHtml(doc.path)}</span>`,
+						`<span class="item-meta">${escapeHtml(doc.preview || "")}</span>`,
+						"</button>",
+					].join("")
+				}).join("")
+			}
+
+			function renderDocument() {
+				if (!state.document) {
+					els.previewTitle.textContent = "Preview"
+					els.previewUrl.textContent = "Select a document to inspect its markdown."
+					els.preview.textContent = "No document selected."
+					return
+				}
+				els.previewTitle.textContent = state.document.title || state.document.path
+				els.previewUrl.textContent = state.document.url || state.document.path
+				els.preview.textContent = state.document.content || ""
+			}
+
+			function renderMetrics(pull, visibleDocs) {
+				els.metricStatus.textContent = pull ? titleCase(pull.status) : "Idle"
+				els.metricOk.textContent = String(pull ? pull.pagesOk || 0 : 0)
+				els.metricErr.textContent = String(pull ? pull.pagesErr || 0 : 0)
+				els.metricDocs.textContent = String(visibleDocs || 0)
+			}
+
+			async function refreshPulls() {
+				setStatus("Loading", "running")
+				try {
+					hydrate(await callTool("webpull_list_pulls", { limit: 20 }))
+					setStatus("Ready", "ready")
+				} catch {
+					setStatus("Ask ChatGPT to open webpull", "failed")
+				}
+			}
+
+			async function showPull(pullId, options) {
+				setStatus("Loading pull", "running")
+				const data = await callTool("webpull_show_pull", { pullId, limit: options?.limit ? options.limit : 50 })
+				hydrate(data)
+				setStatus(data.pull ? titleCase(data.pull.status) : "Ready", data.pull ? data.pull.status : "ready")
+				if (data.pull && data.pull.status === "running") startPolling(data.pull.id)
+			}
+
+			function startPolling(pullId) {
+				if (state.pollTimer) clearInterval(state.pollTimer)
+				state.pollTimer = setInterval(async () => {
+					try {
+						const data = await callTool("webpull_show_pull", { pullId, limit: 50 })
+						hydrate(data)
+						if (!data.pull || data.pull.status !== "running") {
+							clearInterval(state.pollTimer)
+							state.pollTimer = null
+							setStatus(data.pull ? titleCase(data.pull.status) : "Ready", data.pull ? data.pull.status : "ready")
+						}
+					} catch {
+						clearInterval(state.pollTimer)
+						state.pollTimer = null
+					}
+				}, 5000)
+			}
+
+			document.querySelectorAll(".tab").forEach((button) => {
+				button.addEventListener("click", () => setTab(button.dataset.tab))
+			})
+
+			els.form.addEventListener("submit", async (event) => {
+				event.preventDefault()
+				const url = els.url.value.trim()
+				if (!url) return
+				const maxPages = Math.max(1, Math.min(1000, Number(els.maxPages.value) || 100))
+				setStatus("Starting", "running")
+				const data = await callTool("webpull_start_pull", { url, maxPages })
+				hydrate(data)
+				setStatus("Running", "running")
+				setTab("results")
+			})
+
+			els.refresh.addEventListener("click", refreshPulls)
+
+			els.search.addEventListener("click", async () => {
+				const query = els.query.value.trim()
+				if (!query) return
+				setStatus("Searching", "running")
+				const data = await callTool("search", { query, pullId: state.selectedPullId || undefined, limit: 20 })
+				hydrate(data)
+				setTab("results")
+				setStatus("Ready", "ready")
+			})
+
+			els.pulls.addEventListener("click", async (event) => {
+				const button = event.target.closest("[data-pull-id]")
+				if (!button) return
+				state.selectedPullId = button.dataset.pullId
+				state.selectedDocId = null
+				state.document = null
+				renderPulls()
+				renderDocument()
+				setTab("results")
+				await showPull(state.selectedPullId, { limit: 50 })
+			})
+
+			els.docs.addEventListener("click", async (event) => {
+				const button = event.target.closest("[data-doc-id]")
+				if (!button) return
+				const id = Number(button.dataset.docId)
+				state.selectedDocId = id
+				renderDocs()
+				setStatus("Fetching", "running")
+				hydrate(await callTool("fetch", { id }))
+				setStatus("Ready", "ready")
+			})
+
+			window.addEventListener("message", (event) => {
+				if (event.source !== window.parent) return
+				const message = event.data
+				if (!message || message.jsonrpc !== "2.0") return
+				if (message.id && state.pending.has(message.id)) {
+					const pending = state.pending.get(message.id)
+					state.pending.delete(message.id)
+					if (message.error) pending.reject(new Error(message.error.message || "Tool call failed"))
+					else pending.resolve(message.result)
+					return
+				}
+				if (message.method === "ui/notifications/tool-result") {
+					hydrate(message.params?.structuredContent)
+				}
+			}, { passive: true })
+
+			window.addEventListener("openai:set_globals", (event) => {
+				hydrate(event.detail?.globals?.toolOutput || window.openai?.toolOutput)
+			}, { passive: true })
+
+			if (window.openai?.toolOutput) {
+				hydrate(window.openai.toolOutput)
+			}
+
+			refreshPulls()
+
+			function hostname(url) {
+				try {
+					return new URL(url).hostname
+				} catch {
+					return url
+				}
+			}
+
+			function titleCase(value) {
+				const text = String(value || "")
+				return text ? text.charAt(0).toUpperCase() + text.slice(1) : ""
+			}
+
+			function escapeHtml(value) {
+				return String(value == null ? "" : value).replace(/[&<>"']/g, (char) => ({
+					"&": "&amp;",
+					"<": "&lt;",
+					">": "&gt;",
+					'"': "&quot;",
+					"'": "&#39;",
+				})[char])
+			}
+		</script>
+	</body>
+</html>

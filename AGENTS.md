@@ -38,6 +38,8 @@
 | `src/ua.ts` | User-agent strings |
 | `src/ui.ts` | Terminal UI (progress bar, status) |
 | `src/write.ts` | Disk output with path preservation |
+| `src/sources/` | Source adapters (YouTube, Twitter, Google Drive) |
+| `scripts/daemon.ts` | Detached server launcher |
 | `ui/` | React web frontend |
 
 ## Web UI (`ui/`)
@@ -47,11 +49,28 @@
 - Styles in `ui/src/styles.css` using CSS custom properties (dark theme)
 - WebSocket at `/ws` for real-time pull events; REST API at `/api/*`
 
+## Server lifecycle
+
+The server auto-builds the React UI into memory on startup — no manual build step needed. It ignores SIGHUP/SIGTERM (survives terminal closes) and handles SIGINT for graceful shutdown.
+
+| Command | What it does |
+|---------|-------------|
+| `bun run start` | Starts the server in the foreground (UI auto-built into memory) |
+| `bun run dev` | Like `start` but watches `ui/src/` and hot-rebuilds the bundle on changes |
+| `bun run server:start` | Starts a detached daemon (survives terminal close) |
+| `bun run server:stop` | Kills all running webpull server processes |
+| `bun run server:status` | Checks if the server is responding |
+| `bun run build:ui` | One-shot UI bundle build to `ui/dist/main.js` (for CI/deploy) |
+
+The UI bundle is built at startup via `buildUI()` in `src/server.ts` using `Bun.build` and cached in memory as a `Buffer`. The `/dist/main.js` route serves from memory; if the build hasn't completed yet, it falls back to `ui/dist/main.js` on disk. Set `WEBPULL_WATCH=1` to enable file-watching auto-rebuild during development.
+
+The daemon launcher is at `scripts/daemon.ts` — it uses `Bun.spawn({ detached: true })` so the server runs in its own process group.
+
 ## Testing & verification
 
 - TypeScript: `bun run tsc --noEmit`
-- Server smoke: `bun run src/index.ts` (no args) → opens http://localhost:3457
+- Server smoke: `bun run start` → builds UI, starts on http://localhost:3456
+- Browser E2E (Playwright): `WEBPULL_PORT=3461 bun run server:start && WEBPULL_PORT=3461 bun run test/e2e.ts`
 - CLI regression: `bun run src/index.ts https://example.com -m 5`
 - Database at `~/.webpull/webpull.db` (SQLite WAL mode, FTS5)
-- Before publishing: ensure `bun run biome check` passes clean
-EOF
+- Before publishing: ensure `bun run tsc --noEmit` and `bun run biome check` pass clean

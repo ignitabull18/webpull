@@ -24,22 +24,44 @@ export class WorkerPool {
 		urls: string[],
 		onStart: (index: number) => void,
 		onDone: (result: WorkerResult, index: number) => void,
+		signal?: AbortSignal,
 	): Promise<void> {
-		return new Promise((resolve) => {
+		return new Promise((resolve, reject) => {
 			let dispatched = 0
 			let completed = 0
 			const total = urls.length
+			let settled = false
+
+			const finish = () => {
+				if (settled) return
+				settled = true
+				resolve()
+			}
+
+			const cancel = () => {
+				if (settled) return
+				settled = true
+				this.terminate()
+				reject(new Error("Pull cancelled"))
+			}
+
+			if (signal?.aborted) {
+				cancel()
+				return
+			}
+			signal?.addEventListener("abort", cancel, { once: true })
 
 			const dispatchNext = (worker: Worker) => {
-				if (dispatched >= total) return
+				if (settled || signal?.aborted || dispatched >= total) return
 				const idx = dispatched++
 				onStart(idx)
 
 				const onMessage = (e: MessageEvent<WorkerResult>) => {
+					if (settled) return
 					worker.removeEventListener("message", onMessage)
 					completed++
 					onDone(e.data, idx)
-					if (completed === total) resolve()
+					if (completed === total) finish()
 					else dispatchNext(worker)
 				}
 

@@ -1,26 +1,21 @@
-name: Publish Package
+name: CI
 
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
+  pull_request:
 
 permissions:
-  id-token: write
   contents: read
 
 jobs:
-  publish:
+  verify:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: oven-sh/setup-bun@v2
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "24"
-          registry-url: "https://registry.npmjs.org"
 
       - run: bun install --frozen-lockfile
 
@@ -42,5 +37,3 @@ jobs:
 
       # test:smoke starts an isolated server and covers REST API, browser UI, and MCP app.
       - run: bun run test:smoke
-
-      - run: npm publish --provenance
