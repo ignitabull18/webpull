@@ -67,8 +67,8 @@ try {
 		})),
 	)
 	check(
-		"Cloudflare-only unavailable sources are disabled",
-		sourceTabs.filter((tab) => /YouTube|Twitter|Google Drive/.test(tab.text)).every((tab) => tab.disabled),
+		"Cloudflare source integrations are enabled",
+		sourceTabs.filter((tab) => /YouTube|Twitter|Google Drive/.test(tab.text)).every((tab) => !tab.disabled),
 		JSON.stringify(sourceTabs),
 	)
 

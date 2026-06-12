@@ -94,15 +94,17 @@ wrangler d1 execute webpull --remote --file ./cloudflare/schema.sql
 wrangler deploy
 ```
 
-The Cloudflare runtime supports public website documentation pulls at the edge, up to the limit reported by `/api/health`. It uses Cloudflare Browser Rendering when static extraction is too weak, publishes markdown exports to R2, applies security headers to static assets and API responses, and runs a scheduled retention cleanup from `wrangler.jsonc`.
+The Cloudflare runtime supports public website documentation pulls plus public YouTube videos/playlists, public X/Twitter tweets/pages, and public Google Drive files/folders at the edge, up to the limit reported by `/api/health`. It uses Cloudflare Browser Rendering when static extraction is too weak, publishes markdown exports to R2, applies security headers to static assets and API responses, exposes `/mcp`, and runs a scheduled retention cleanup from `wrangler.jsonc`.
 
-Local integrations that need local credentials, including YouTube, Twitter, and Google Drive, remain available through `bun run start`.
+Private account-only sources such as X bookmarks or private Google Drive files require those items to be publicly shared or a future OAuth-backed account connection.
 
 Run the live production smoke after a Cloudflare deploy:
 
 ```bash
 bunx playwright install chromium
 bun run test:cloudflare-ui
+bun run test:cloudflare-mcp
+bun run test:cloudflare-sources
 ```
 
 Set `WEBPULL_CLOUDFLARE_URL` to test a non-default Worker URL.

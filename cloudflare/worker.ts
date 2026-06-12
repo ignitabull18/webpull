@@ -28,6 +28,8 @@ interface PullJob {
 	pullId: string
 	url: string
 	maxPages: number
+	source?: string
+	target?: string
 }
 
 interface HealthResponse {
@@ -47,6 +49,14 @@ interface DocRow {
 	url: string
 	title: string
 	content: string
+}
+
+interface CloudSourceItem {
+	id: string
+	title: string
+	url: string
+	content?: string
+	meta?: Record<string, unknown>
 }
 
 const MAX_CLOUD_PAGES = 50
@@ -316,6 +326,51 @@ function extractTitle(html: string, url: string): string {
 	const h1 = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i)?.[1]
 	if (h1) return stripTags(h1)
 	return new URL(url).pathname || new URL(url).hostname
+}
+
+function xmlText(xml: string, tag: string): string {
+	const match = xml.match(new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`, "i"))
+	return match ? normalizeText(match[1]!.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")) : ""
+}
+
+function extractYouTubeVideoId(raw: string): string | null {
+	const trimmed = raw.trim()
+	if (/^[\w-]{11}$/.test(trimmed)) return trimmed
+	const match = trimmed.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|shorts\/))([\w-]{11})/)
+	if (match) return match[1]!
+	try {
+		return new URL(trimmed).searchParams.get("v")
+	} catch {
+		return null
+	}
+}
+
+function extractPlaylistId(raw: string): string | null {
+	if (/^PL[\w-]{10,}$/.test(raw.trim())) return raw.trim()
+	try {
+		return new URL(raw).searchParams.get("list")
+	} catch {
+		return null
+	}
+}
+
+function extractDriveId(raw: string): { kind: "file" | "folder"; id: string } | null {
+	const trimmed = raw.trim()
+	const folder = trimmed.match(/drive\.google\.com\/drive\/(?:u\/\d+\/)?folders\/([a-zA-Z0-9_-]+)/)
+	if (folder) return { kind: "folder", id: folder[1]! }
+	const file = trimmed.match(/drive\.google\.com\/file\/d\/([a-zA-Z0-9_-]+)/)
+	if (file) return { kind: "file", id: file[1]! }
+	if (trimmed.startsWith("folder:")) return { kind: "folder", id: trimmed.slice("folder:".length) }
+	if (trimmed.startsWith("file:")) return { kind: "file", id: trimmed.slice("file:".length) }
+	if (/^[a-zA-Z0-9_-]{20,}$/.test(trimmed)) return { kind: "file", id: trimmed }
+	return null
+}
+
+function extractTweetId(raw: string): string | null {
+	const match = raw.match(/(?:twitter\.com|x\.com)\/[^/]+\/status\/(\d+)/)
+	if (match) return match[1]!
+	if (raw.startsWith("thread:")) return raw.slice("thread:".length)
+	return /^\d{10,}$/.test(raw.trim()) ? raw.trim() : null
 }
 
 function markdownBody(content: string): string {
@@ -627,6 +682,221 @@ async function runCloudPull(env: Env, pullId: string, url: string, maxPages: num
 	}
 }
 
+async function discoverYouTube(target: string, max: number): Promise<CloudSourceItem[]> {
+	const playlistId = extractPlaylistId(target)
+	if (playlistId) {
+		const feed = await fetchTextWithRetry(
+			`https://www.youtube.com/feeds/videos.xml?playlist_id=${encodeURIComponent(playlistId)}`,
+		)
+		if (!feed) throw new Error("Could not load YouTube playlist feed")
+		return [...feed.text.matchAll(/<entry>([\s\S]*?)<\/entry>/gi)].slice(0, max).map((entry, index) => {
+			const xml = entry[1]!
+			const id = xmlText(xml, "yt:videoId") || `video-${index + 1}`
+			return {
+				id,
+				title: xmlText(xml, "title") || `YouTube video ${id}`,
+				url: `https://www.youtube.com/watch?v=${id}`,
+				meta: {
+					channel: xmlText(xml, "name"),
+					published: xmlText(xml, "published"),
+					rank: index + 1,
+				},
+			}
+		})
+	}
+
+	const videoId = extractYouTubeVideoId(target)
+	if (!videoId) throw new Error("Use a YouTube video URL/ID or playlist URL/ID on Cloudflare.")
+	const oembed = await fetchJson<{ title?: string; author_name?: string }>(
+		`https://www.youtube.com/oembed?format=json&url=${encodeURIComponent(`https://www.youtube.com/watch?v=${videoId}`)}`,
+	)
+	return [
+		{
+			id: videoId,
+			title: oembed?.title || `YouTube video ${videoId}`,
+			url: `https://www.youtube.com/watch?v=${videoId}`,
+			meta: { channel: oembed?.author_name },
+		},
+	]
+}
+
+async function fetchYouTubeItem(item: CloudSourceItem): Promise<CloudSourceItem> {
+	const transcriptList = await fetchTextWithRetry(
+		`https://video.google.com/timedtext?type=list&v=${encodeURIComponent(item.id)}`,
+	)
+	let transcript = ""
+	if (transcriptList?.text) {
+		const lang =
+			transcriptList.text.match(/lang_code="(en[^"]*)"/i)?.[1] || transcriptList.text.match(/lang_code="([^"]+)"/i)?.[1]
+		if (lang) {
+			const track = await fetchTextWithRetry(
+				`https://video.google.com/timedtext?v=${encodeURIComponent(item.id)}&lang=${encodeURIComponent(lang)}&fmt=srv3`,
+			)
+			if (track?.text) transcript = stripTags(track.text)
+		}
+	}
+	const hasTranscript = transcript.length > 0
+	const content =
+		`---\ntitle: "${escapeFrontmatter(item.title)}"\nurl: "${item.url}"\nvideo_id: "${item.id}"\nhas_transcript: ${hasTranscript}\n---\n\n` +
+		`# ${item.title}\n\n${hasTranscript ? transcript : `_No public transcript available for this video._`}`
+	return { ...item, content }
+}
+
+async function discoverTwitter(target: string, max: number): Promise<CloudSourceItem[]> {
+	const tweetId = extractTweetId(target)
+	if (tweetId) {
+		const url = target.startsWith("http") ? target : `https://x.com/i/status/${tweetId}`
+		const embed = await fetchJson<{ html?: string; author_name?: string; url?: string }>(
+			`https://publish.twitter.com/oembed?omit_script=1&url=${encodeURIComponent(url)}`,
+		)
+		const text = embed?.html ? stripTags(embed.html) : ""
+		return [
+			{
+				id: tweetId,
+				title: text.slice(0, 100) || `Tweet ${tweetId}`,
+				url: embed?.url || url,
+				content:
+					`---\ntitle: "Tweet ${tweetId}"\nurl: "${embed?.url || url}"\ntweet_id: "${tweetId}"\n---\n\n` +
+					`${text || "_Could not extract public tweet text._"}`,
+				meta: { author: embed?.author_name },
+			},
+		]
+	}
+
+	const profile = target.startsWith("@") ? `https://x.com/${target.slice(1)}` : target
+	const fetched = await fetchTextWithRetry(profile)
+	if (!fetched) throw new Error("Could not fetch public X/Twitter page")
+	const title = extractTitle(fetched.text, fetched.url)
+	return [
+		{
+			id: title.replace(/\W+/g, "-").slice(0, 80) || "twitter-page",
+			title,
+			url: fetched.url,
+			content: frontmatter(title, fetched.url, "twitter-public-page") + metadataMarkdown(fetched.text, fetched.url),
+		},
+	].slice(0, max)
+}
+
+async function discoverGDrive(target: string, max: number): Promise<CloudSourceItem[]> {
+	const parsed = extractDriveId(target)
+	if (!parsed) throw new Error("Use a public Google Drive file URL/ID or folder URL/ID.")
+	if (parsed.kind === "file") return [await fetchGDriveFile(parsed.id)]
+
+	const folderPage = await fetchTextWithRetry(`https://drive.google.com/drive/folders/${encodeURIComponent(parsed.id)}`)
+	if (!folderPage) throw new Error("Could not fetch public Google Drive folder")
+	const ids = [...folderPage.text.matchAll(/\/file\/d\/([a-zA-Z0-9_-]+)/g)].map((match) => match[1]!)
+	const uniqueIds = [...new Set(ids)].slice(0, max)
+	if (uniqueIds.length === 0) {
+		return [
+			{
+				id: parsed.id,
+				title: "Google Drive folder",
+				url: `https://drive.google.com/drive/folders/${parsed.id}`,
+				content:
+					`---\ntitle: "Google Drive folder"\nurl: "https://drive.google.com/drive/folders/${parsed.id}"\nfile_id: "${parsed.id}"\n---\n\n` +
+					"_No public files were discoverable in this folder._",
+			},
+		]
+	}
+	return Promise.all(uniqueIds.map((id) => fetchGDriveFile(id)))
+}
+
+async function fetchGDriveFile(fileId: string): Promise<CloudSourceItem> {
+	const viewUrl = `https://drive.google.com/file/d/${encodeURIComponent(fileId)}/view`
+	const candidates = [
+		`https://drive.usercontent.google.com/download?id=${encodeURIComponent(fileId)}&export=download&confirm=t`,
+		`https://drive.google.com/uc?export=download&id=${encodeURIComponent(fileId)}&confirm=t`,
+		`https://docs.google.com/document/d/${encodeURIComponent(fileId)}/export?format=txt`,
+		`https://docs.google.com/document/d/${encodeURIComponent(fileId)}/export?exportFormat=txt`,
+	]
+	let text = ""
+	for (const candidate of candidates) {
+		const fetched = await fetchTextWithRetry(candidate)
+		const candidateText = normalizeText(fetched?.text || "")
+		if (
+			candidateText &&
+			!/Google Drive|Sign in|You need access|Request access|virus scan warning|quota exceeded/i.test(
+				candidateText.slice(0, 500),
+			)
+		) {
+			text = candidateText
+			break
+		}
+	}
+	const title = text ? extractTitle(text, viewUrl) : `Google Drive file ${fileId}`
+	const content =
+		`---\ntitle: "${escapeFrontmatter(title)}"\nurl: "${viewUrl}"\nfile_id: "${fileId}"\n---\n\n` +
+		(text ? normalizeText(stripTags(text)) : "_This Google Drive file is not publicly downloadable as text._")
+	return { id: fileId, title, url: viewUrl, content, meta: { fileId } }
+}
+
+async function fetchJson<T>(url: string): Promise<T | null> {
+	const fetched = await fetch(url, { headers: { "user-agent": "webpull/0.1.3" } }).catch(() => null)
+	if (!fetched?.ok) return null
+	return (await fetched.json().catch(() => null)) as T | null
+}
+
+async function discoverCloudSource(source: string, target: string, max: number): Promise<CloudSourceItem[]> {
+	if (source === "youtube") return discoverYouTube(target, max)
+	if (source === "twitter") return discoverTwitter(target, max)
+	if (source === "gdrive") return discoverGDrive(target, max)
+	throw new Error(`Unsupported source: ${source}`)
+}
+
+async function runCloudSourcePull(
+	env: Env,
+	pullId: string,
+	source: string,
+	target: string,
+	maxPages: number,
+): Promise<void> {
+	let ok = 0
+	let err = 0
+	try {
+		const items = await discoverCloudSource(source, target, maxPages)
+		for (const item of items.slice(0, maxPages)) {
+			if (await isPullCancelled(env, pullId)) return
+			try {
+				const enriched = source === "youtube" ? await fetchYouTubeItem(item) : item
+				const path = `${source}/${pathForUrl(enriched.url)}`
+				await env.DB.prepare(
+					`INSERT INTO documents (pull_id, path, url, title, content)
+					 VALUES (?, ?, ?, ?, ?)
+					 ON CONFLICT(pull_id, path) DO UPDATE SET
+						url = excluded.url,
+						title = excluded.title,
+						content = excluded.content`,
+				)
+					.bind(pullId, path, enriched.url, enriched.title, enriched.content || "")
+					.run()
+				ok++
+			} catch (caught) {
+				err++
+				await env.DB.prepare("INSERT INTO page_failures (pull_id, url, reason) VALUES (?, ?, ?)")
+					.bind(pullId, item.url, caught instanceof Error ? caught.message : String(caught))
+					.run()
+			}
+			await env.DB.prepare("UPDATE pulls SET pages_ok = ?, pages_err = ? WHERE id = ?").bind(ok, err, pullId).run()
+		}
+		const status = ok > 0 && err === 0 ? "complete" : ok > 0 ? "partial" : "failed"
+		await env.DB.prepare(
+			"UPDATE pulls SET status = ?, pages_ok = ?, pages_err = ?, finished_at = datetime('now') WHERE id = ?",
+		)
+			.bind(status, ok, err, pullId)
+			.run()
+	} catch (caught) {
+		const reason = caught instanceof Error ? caught.message : String(caught)
+		await env.DB.prepare("INSERT INTO page_failures (pull_id, url, reason) VALUES (?, ?, ?)")
+			.bind(pullId, target, reason)
+			.run()
+		await env.DB.prepare(
+			"UPDATE pulls SET status = 'failed', pages_ok = ?, pages_err = ?, finished_at = datetime('now') WHERE id = ?",
+		)
+			.bind(ok, err + 1, pullId)
+			.run()
+	}
+}
+
 async function isPullCancelled(env: Env, pullId: string): Promise<boolean> {
 	const pull = await env.DB.prepare("SELECT status FROM pulls WHERE id = ?").bind(pullId).first<{ status: string }>()
 	return pull?.status === "cancelled"
@@ -840,23 +1110,20 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
 		const limited = await checkRateLimit(env, request)
 		if (limited) return limited
 		const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
-		if (body.source)
-			return error(
-				"Cloudflare deployment currently supports public website pulls. Use the local app for source integrations.",
-				400,
-			)
-		const normalized = normalizeUrl(String(body.url ?? ""))
-		if (!normalized) return error("Valid url is required")
+		const source = String(body.source || "")
+		const target = String(body.target || "")
+		const normalized = source ? target.trim() : normalizeUrl(String(body.url ?? ""))
+		if (!normalized) return error(source ? "target is required" : "Valid url is required")
 		const maxPages = Math.max(1, Math.min(Number(body.maxPages || MAX_CLOUD_PAGES), MAX_CLOUD_PAGES))
 		const pullId = crypto.randomUUID()
 		await env.DB.prepare(
-			`INSERT INTO pulls (id, url, out_dir, max_pages, worker_count, status, pages_ok, pages_err, started_at)
-			 VALUES (?, ?, ?, ?, ?, 'queued', 0, 0, datetime('now'))`,
+			`INSERT INTO pulls (id, url, source, out_dir, max_pages, worker_count, status, pages_ok, pages_err, started_at)
+			 VALUES (?, ?, ?, ?, ?, ?, 'queued', 0, 0, datetime('now'))`,
 		)
-			.bind(pullId, normalized, `./${new URL(normalized).hostname}`, maxPages, CONCURRENCY)
+			.bind(pullId, normalized, source, source ? "./pulls" : `./${new URL(normalized).hostname}`, maxPages, CONCURRENCY)
 			.run()
 		await env.DB.prepare("INSERT INTO pull_owners (pull_id, owner_key) VALUES (?, ?)").bind(pullId, owner.key).run()
-		await env.PULL_QUEUE.send({ pullId, url: normalized, maxPages } satisfies PullJob)
+		await env.PULL_QUEUE.send({ pullId, url: normalized, maxPages, source, target: normalized } satisfies PullJob)
 		return withOwnerCookie(json({ pullId }), owner)
 	}
 
@@ -962,9 +1229,17 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
 	if (path === "/api/projects" && request.method === "GET") return json([])
 	if (path === "/api/source-status" && request.method === "GET") {
 		return json({
-			youtube: { installed: false, authenticated: false, message: "Use the local Bun app for YouTube pulls." },
-			twitter: { installed: false, authenticated: false, message: "Use the local Bun app for Twitter pulls." },
-			gdrive: { installed: false, authenticated: false, message: "Use the local Bun app for Google Drive pulls." },
+			youtube: {
+				installed: true,
+				authenticated: true,
+				message: "Ready for public videos and playlists on Cloudflare.",
+			},
+			twitter: {
+				installed: true,
+				authenticated: true,
+				message: "Ready for public tweets and public pages on Cloudflare.",
+			},
+			gdrive: { installed: true, authenticated: true, message: "Ready for public shared Drive files and folders." },
 		})
 	}
 	if (path === "/api/destination-status" && request.method === "GET") {
@@ -974,7 +1249,18 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
 		})
 	}
 	if (path === "/api/drive/folders" && request.method === "GET") return json({ folders: [] })
-	if (path === "/api/source/preview" && request.method === "POST") return json({ items: [], total: 0 })
+	if (path === "/api/source/preview" && request.method === "POST") {
+		const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+		const items = await discoverCloudSource(
+			String(body.source || ""),
+			String(body.target || ""),
+			Number(body.max || 10),
+		)
+		return json({
+			items: items.map((item) => ({ id: item.id, title: item.title, url: item.url, meta: item.meta ?? {} })),
+			total: items.length,
+		})
+	}
 	if (path === "/api/destination/push" && request.method === "POST") {
 		const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
 		const pullId = String(body.pullId || "")
@@ -1006,9 +1292,13 @@ function mcpTools() {
 			type: "object",
 			properties: {
 				url: { type: "string", description: "Public website or docs URL to pull." },
+				source: { type: "string", enum: ["youtube", "twitter", "gdrive"] },
+				target: {
+					type: "string",
+					description: "Source target such as a YouTube video, public tweet, or public Drive file.",
+				},
 				maxPages: { type: "number", minimum: 1, maximum: MAX_CLOUD_PAGES },
 			},
-			required: ["url"],
 		}),
 		mcpTool("webpull_show_pull", "Show webpull pull", "Show one pull and its markdown documents.", {
 			type: "object",
@@ -1078,18 +1368,20 @@ async function callMcpTool(
 	if (name === "webpull_start_pull") {
 		const limited = await checkRateLimit(env, request)
 		if (limited) return limited
-		const normalized = normalizeUrl(String(args.url ?? ""))
-		if (!normalized) return mcpJson({ content: toolText("Valid url is required"), isError: true }, 400)
+		const source = String(args.source || "")
+		const normalized = source ? String(args.target || args.url || "").trim() : normalizeUrl(String(args.url ?? ""))
+		if (!normalized)
+			return mcpJson({ content: toolText(source ? "target is required" : "Valid url is required"), isError: true }, 400)
 		const maxPages = Math.max(1, Math.min(Number(args.maxPages || MAX_CLOUD_PAGES), MAX_CLOUD_PAGES))
 		const pullId = crypto.randomUUID()
 		await env.DB.prepare(
-			`INSERT INTO pulls (id, url, out_dir, max_pages, worker_count, status, pages_ok, pages_err, started_at)
-			 VALUES (?, ?, ?, ?, ?, 'queued', 0, 0, datetime('now'))`,
+			`INSERT INTO pulls (id, url, source, out_dir, max_pages, worker_count, status, pages_ok, pages_err, started_at)
+			 VALUES (?, ?, ?, ?, ?, ?, 'queued', 0, 0, datetime('now'))`,
 		)
-			.bind(pullId, normalized, `./${new URL(normalized).hostname}`, maxPages, CONCURRENCY)
+			.bind(pullId, normalized, source, source ? "./pulls" : `./${new URL(normalized).hostname}`, maxPages, CONCURRENCY)
 			.run()
 		await env.DB.prepare("INSERT INTO pull_owners (pull_id, owner_key) VALUES (?, ?)").bind(pullId, owner.key).run()
-		await env.PULL_QUEUE.send({ pullId, url: normalized, maxPages } satisfies PullJob)
+		await env.PULL_QUEUE.send({ pullId, url: normalized, maxPages, source, target: normalized } satisfies PullJob)
 		const pull = await env.DB.prepare("SELECT * FROM pulls WHERE id = ?").bind(pullId).first<PullRow>()
 		return withOwnerCookie(
 			mcpJson({
@@ -1253,7 +1545,7 @@ export default {
 	},
 	async queue(batch: MessageBatch<PullJob>, env: Env): Promise<void> {
 		for (const message of batch.messages) {
-			const { pullId, url, maxPages } = message.body
+			const { pullId, url, maxPages, source, target } = message.body
 			try {
 				const pull = await env.DB.prepare("SELECT id, status FROM pulls WHERE id = ?").bind(pullId).first<{
 					id: string
@@ -1266,7 +1558,8 @@ export default {
 				await env.DB.prepare("UPDATE pulls SET status = 'running' WHERE id = ? AND status = 'queued'")
 					.bind(pullId)
 					.run()
-				await runCloudPull(env, pullId, url, maxPages)
+				if (source) await runCloudSourcePull(env, pullId, source, target || url, maxPages)
+				else await runCloudPull(env, pullId, url, maxPages)
 				message.ack()
 			} catch (caught) {
 				const reason = caught instanceof Error ? caught.message : String(caught)
