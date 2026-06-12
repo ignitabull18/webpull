@@ -21,7 +21,13 @@ jobs:
 
       - run: bun run biome check
 
+      - run: bun run cloudflare:types
+
       - run: bun run tsc --noEmit
+
+      - run: bun run cloudflare:build
+
+      - run: bun run test/cloudflare-extract.ts
 
       - run: bun run test:db
 

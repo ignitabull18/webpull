@@ -1,5 +1,4 @@
 import { resolve } from "node:path"
-import { RESOURCE_MIME_TYPE, registerAppResource, registerAppTool } from "@modelcontextprotocol/ext-apps/server"
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js"
 import { Effect } from "effect"
@@ -23,8 +22,51 @@ const DEFAULT_MAX_PAGES = 100
 const MAX_SEARCH_LIMIT = 20
 const MAX_CONTENT_CHARS = 12000
 const widgetHtml = await Bun.file(WIDGET_PATH).text()
+const RESOURCE_MIME_TYPE = "text/html;profile=mcp-app"
+const RESOURCE_URI_META_KEY = "ui/resourceUri"
 
 type ToolText = { type: "text"; text: string }
+type AppToolMeta = Record<string, unknown> & {
+	ui?: {
+		resourceUri?: string
+		[key: string]: unknown
+	}
+}
+type AppToolDefinition = Record<string, unknown> & {
+	_meta?: AppToolMeta
+}
+type AppToolHandler = (...args: any[]) => unknown
+type AppResourceMetadata = Record<string, unknown>
+type AppResourceHandler = (...args: any[]) => unknown
+
+function normalizeAppToolMeta(meta?: AppToolMeta): AppToolMeta | undefined {
+	if (!meta) return meta
+	const resourceUri = meta.ui?.resourceUri ?? meta[RESOURCE_URI_META_KEY]
+	if (!resourceUri || typeof resourceUri !== "string") return meta
+	return {
+		...meta,
+		[RESOURCE_URI_META_KEY]: resourceUri,
+		ui: { ...meta.ui, resourceUri },
+	}
+}
+
+function registerAppTool(server: McpServer, name: string, definition: AppToolDefinition, handler: AppToolHandler) {
+	return server.registerTool(
+		name,
+		{ ...definition, _meta: normalizeAppToolMeta(definition._meta) } as any,
+		handler as any,
+	)
+}
+
+function registerAppResource(
+	server: McpServer,
+	name: string,
+	uri: string,
+	metadata: AppResourceMetadata,
+	handler: AppResourceHandler,
+) {
+	return server.registerResource(name, uri, { mimeType: RESOURCE_MIME_TYPE, ...metadata }, handler as any)
+}
 
 function toolText(text: string): ToolText[] {
 	return [{ type: "text", text }]

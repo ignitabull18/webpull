@@ -161,7 +161,7 @@ export default function Projects() {
 				setNewName("")
 				await fetchProjects()
 			} else {
-				const data = await res.json().catch(() => ({}))
+				const data = (await res.json().catch(() => ({}))) as { error?: string }
 				setError(data.error || `Failed to create project (${res.status})`)
 			}
 		} catch (e) {

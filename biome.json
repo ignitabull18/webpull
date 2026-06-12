@@ -40,7 +40,17 @@
 		}
 	},
 	"files": {
-		"includes": ["src/**", "ui/src/**", "ui/index.html", "test/**"],
+		"includes": [
+			"src/**",
+			"ui/src/**",
+			"ui/index.html",
+			"test/**",
+			"cloudflare/**",
+			"!cloudflare/dist",
+			"!cloudflare/worker-configuration.d.ts",
+			"scripts/**",
+			"wrangler.jsonc"
+		],
 		"maxSize": 2000000
 	}
 }

@@ -22,6 +22,12 @@ interface PullInfo {
 	out_dir: string
 }
 
+interface PageFailure {
+	url: string
+	reason: string
+	created_at: string
+}
+
 interface SearchResult {
 	id: number
 	pull_id: string
@@ -78,6 +84,7 @@ export default function Results() {
 	const { pullId } = useParams<{ pullId: string }>()
 	const navigate = useNavigate()
 	const [docs, setDocs] = useState<Doc[]>([])
+	const [failures, setFailures] = useState<PageFailure[]>([])
 	const [pull, setPull] = useState<PullInfo | null>(null)
 	const [selectedDoc, setSelectedDoc] = useState<Doc | null>(null)
 	const [searchQuery, setSearchQuery] = useState("")
@@ -86,13 +93,15 @@ export default function Results() {
 	const [pushing, setPushing] = useState(false)
 	const [pushError, setPushError] = useState("")
 	const [pushOk, setPushOk] = useState(false)
+	const [pushFiles, setPushFiles] = useState<{ path: string; url: string }[]>([])
 
 	useEffect(() => {
 		async function load() {
 			try {
-				const [pullRes, docsRes] = await Promise.all([
+				const [pullRes, docsRes, failuresRes] = await Promise.all([
 					fetch(`/api/pulls/${pullId}`),
 					fetch(`/api/pulls/${pullId}/docs`),
+					fetch(`/api/pulls/${pullId}/failures`),
 				])
 				if (pullRes.ok) setPull((await pullRes.json()) as PullInfo)
 				if (docsRes.ok) {
@@ -100,6 +109,7 @@ export default function Results() {
 					setDocs(docsData)
 					if (docsData.length > 0) setSelectedDoc(docsData[0]!)
 				}
+				if (failuresRes.ok) setFailures((await failuresRes.json()) as PageFailure[])
 			} catch {
 			} finally {
 				setLoading(false)
@@ -153,19 +163,28 @@ export default function Results() {
 		)
 	}
 
-	const handlePushToDrive = async () => {
+	const downloadExport = (format: "markdown" | "json") => {
+		const a = document.createElement("a")
+		a.href = `/api/pulls/${pullId}/export?format=${format}`
+		a.download = ""
+		a.click()
+	}
+
+	const handlePushToR2 = async () => {
 		setPushing(true)
 		setPushError("")
 		setPushOk(false)
+		setPushFiles([])
 		try {
 			const res = await fetch("/api/destination/push", {
 				method: "POST",
 				headers: { "content-type": "application/json" },
-				body: JSON.stringify({ pullId, destination: "gdrive", target: "root" }),
+				body: JSON.stringify({ pullId, destination: "r2" }),
 			})
 			const data = (await res.json()) as any
 			if (res.ok && data.ok > 0) {
 				setPushOk(true)
+				setPushFiles(data.files || [])
 			} else {
 				setPushError(data.error || data.files?.[0]?.error || "Push failed")
 			}
@@ -191,29 +210,25 @@ export default function Results() {
 			<div className="results-sidebar">
 				<div className="results-toolbar">
 					<h3>{hostname}</h3>
-					{pull?.status === "complete" && (
-						<button
-							type="button"
-							className="btn btn-ghost btn-small"
-							onClick={() => {
-								const a = document.createElement("a")
-								a.href = `/api/pulls/${pullId}/export`
-								a.download = ""
-								a.click()
-							}}
-						>
-							Download ZIP
+					{(pull?.status === "complete" || pull?.status === "partial") && (
+						<button type="button" className="btn btn-ghost btn-small" onClick={() => downloadExport("markdown")}>
+							Download MD
 						</button>
 					)}
-					{pull?.status === "complete" && (
+					{(pull?.status === "complete" || pull?.status === "partial") && (
+						<button type="button" className="btn btn-ghost btn-small" onClick={() => downloadExport("json")}>
+							Download JSON
+						</button>
+					)}
+					{(pull?.status === "complete" || pull?.status === "partial") && (
 						<button
 							type="button"
 							className="btn btn-ghost btn-small"
-							onClick={handlePushToDrive}
+							onClick={handlePushToR2}
 							disabled={pushing || pushOk}
-							title="Push all files to Google Drive"
+							title="Publish all markdown files to Cloudflare R2"
 						>
-							{pushing ? <span className="spinner" /> : pushOk ? "✓ Pushed" : "Push to Drive"}
+							{pushing ? <span className="spinner" /> : pushOk ? "✓ Published" : "Publish to R2"}
 						</button>
 					)}
 				</div>
@@ -261,6 +276,16 @@ export default function Results() {
 					{pushError && (
 						<div className="error-msg" style={{ marginBottom: "6px", fontSize: "11px" }}>
 							{pushError}
+						</div>
+					)}
+					{pushFiles.length > 0 && (
+						<div className="success-msg" style={{ marginBottom: "6px", fontSize: "11px" }}>
+							Published {pushFiles.length} files to R2
+						</div>
+					)}
+					{failures.length > 0 && (
+						<div className="error-msg" style={{ marginBottom: "6px", fontSize: "11px" }}>
+							{failures.length} page{failures.length === 1 ? "" : "s"} failed. First: {failures[0]?.reason}
 						</div>
 					)}
 					<button type="button" className="btn btn-ghost btn-small" onClick={() => navigate("/")}>

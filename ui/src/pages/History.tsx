@@ -29,6 +29,8 @@ interface SearchResult {
 const STATUS_ICON: Record<string, string> = {
 	complete: "✓",
 	running: "○",
+	queued: "○",
+	cancelled: "×",
 	failed: "✕",
 }
 

@@ -68,7 +68,7 @@ interface ProgressState {
 	workerStates: ("idle" | "busy")[]
 	recentFiles: string[]
 	elapsed: number
-	status: "discovering" | "running" | "complete" | "error"
+	status: "discovering" | "running" | "complete" | "cancelled" | "error"
 	errorMsg?: string
 	source?: string
 }
@@ -179,6 +179,66 @@ export default function Pull() {
 	})
 
 	useEffect(() => {
+		if (!pullId || (state.status !== "running" && state.status !== "discovering")) return
+		let cancelled = false
+
+		const poll = async () => {
+			try {
+				const [pullRes, docsRes] = await Promise.all([
+					fetch(`/api/pulls/${pullId}`),
+					fetch(`/api/pulls/${pullId}/docs`),
+				])
+				if (cancelled) return
+				if (pullRes.ok) {
+					const pull = (await pullRes.json()) as {
+						status: string
+						pages_ok: number
+						pages_err: number
+						max_pages: number
+						worker_count: number
+					}
+					setState((s) => ({
+						...s,
+						total: Math.max(s.total, pull.max_pages || s.total),
+						ok: pull.pages_ok ?? s.ok,
+						err: pull.pages_err ?? s.err,
+						workerCount: pull.worker_count || s.workerCount,
+						workerStates:
+							pull.status === "running"
+								? Array(pull.worker_count || s.workerCount).fill("busy")
+								: Array(pull.worker_count || s.workerCount).fill("idle"),
+						status:
+							pull.status === "complete" || pull.status === "partial"
+								? "complete"
+								: pull.status === "cancelled"
+									? "cancelled"
+									: pull.status === "failed"
+										? "error"
+										: pull.pages_ok + pull.pages_err > 0
+											? "running"
+											: s.status,
+					}))
+				}
+				if (docsRes.ok) {
+					const docs = (await docsRes.json()) as Doc[]
+					setDocMap((prev) => {
+						const next = { ...prev }
+						for (const doc of docs) next[doc.path] = doc
+						return next
+					})
+				}
+			} catch {}
+		}
+
+		poll()
+		const interval = setInterval(poll, 2000)
+		return () => {
+			cancelled = true
+			clearInterval(interval)
+		}
+	}, [pullId, state.status])
+
+	useEffect(() => {
 		if (state.status === "complete" && !destIntent.current?.destination) {
 			const t = setTimeout(() => navigate(`/results/${pullId}`), 1200)
 			return () => clearTimeout(t)
@@ -194,6 +254,25 @@ export default function Pull() {
 			if (tickRef.current) clearInterval(tickRef.current)
 		}
 	}, [state.status])
+
+	const handleCancel = async () => {
+		if (!pullId) return
+		try {
+			const res = await fetch(`/api/pulls/${pullId}`, { method: "DELETE" })
+			if (res.ok) {
+				setState((s) => ({
+					...s,
+					status: "cancelled",
+					workerStates: Array(s.workerCount).fill("idle") as ("idle" | "busy")[],
+				}))
+			} else {
+				const data = (await res.json().catch(() => ({}))) as { error?: string }
+				setState((s) => ({ ...s, errorMsg: data.error || "Could not cancel pull" }))
+			}
+		} catch (e) {
+			setState((s) => ({ ...s, errorMsg: String(e) }))
+		}
+	}
 
 	const handlePush = async () => {
 		if (!destIntent.current || pushing) return
@@ -256,7 +335,9 @@ export default function Pull() {
 					: "Pulling…"
 				: state.status === "complete"
 					? "Complete"
-					: "Failed"
+					: state.status === "cancelled"
+						? "Cancelled"
+						: "Failed"
 
 	const renderTree = (nodes: TreeNode[], depth = 0) => {
 		return nodes.map((node) => (
@@ -291,6 +372,8 @@ export default function Pull() {
 						<span style={{ fontSize: "16px", color: "var(--green)" }}>✓</span>
 					) : state.status === "error" ? (
 						<span style={{ fontSize: "16px", color: "var(--red)" }}>✕</span>
+					) : state.status === "cancelled" ? (
+						<span style={{ fontSize: "16px", color: "var(--text-tertiary)" }}>×</span>
 					) : null}
 					<h1>{statusLabel}</h1>
 				</div>
@@ -347,6 +430,12 @@ export default function Pull() {
 					</span>
 				</div>
 
+				{(state.status === "discovering" || state.status === "running") && (
+					<button type="button" className="btn btn-secondary" style={{ marginTop: "16px" }} onClick={handleCancel}>
+						Cancel
+					</button>
+				)}
+
 				{state.recentFiles.length > 0 && (
 					<div className="file-stream">
 						{state.recentFiles.map((f) => (
@@ -399,7 +488,7 @@ export default function Pull() {
 					</div>
 				)}
 
-				{state.status === "error" && (
+				{(state.status === "error" || state.status === "cancelled") && (
 					<button
 						type="button"
 						className="btn btn-secondary"

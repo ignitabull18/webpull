@@ -10,6 +10,8 @@ example.com/
 ignitabull.com/
 pulls/
 src/.tmp-*
+cloudflare/dist/
+cloudflare/worker-configuration.d.ts
 
 # code coverage
 coverage

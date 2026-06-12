@@ -76,6 +76,37 @@ Available tools:
 - `search` searches the pulled markdown archive.
 - `fetch` returns exact markdown for a document returned by search.
 
+## Cloudflare deployment
+
+webpull can also run as a Cloudflare Workers app. The deployed app serves the React UI from Workers static assets, stores pull history and markdown in D1, and uses polling so progress survives dropped browser connections.
+
+The Worker uses these Cloudflare resources:
+
+- D1 database: `webpull`
+- R2 bucket: `webpull-exports`
+- Queue: `webpull-pulls`
+- Dead-letter queue: `webpull-pulls-dlq`
+- Browser Rendering binding: `BROWSER`
+
+```bash
+bun run cloudflare:build
+wrangler d1 execute webpull --remote --file ./cloudflare/schema.sql
+wrangler deploy
+```
+
+The Cloudflare runtime supports public website documentation pulls at the edge, up to the limit reported by `/api/health`. It uses Cloudflare Browser Rendering when static extraction is too weak, publishes markdown exports to R2, applies security headers to static assets and API responses, and runs a scheduled retention cleanup from `wrangler.jsonc`.
+
+Local integrations that need local credentials, including YouTube, Twitter, and Google Drive, remain available through `bun run start`.
+
+Run the live production smoke after a Cloudflare deploy:
+
+```bash
+bunx playwright install chromium
+bun run test:cloudflare-ui
+```
+
+Set `WEBPULL_CLOUDFLARE_URL` to test a non-default Worker URL.
+
 ## How it works
 
 1. **Discovers pages** via sitemap.xml, nav link extraction, JS bundle route parsing, or link crawling
@@ -112,7 +143,10 @@ Before publishing or opening a PR, run the full local gate:
 
 ```bash
 bun run biome check
+bun run cloudflare:build
+bun run cloudflare:types
 bun run tsc --noEmit
+bun run test/cloudflare-extract.ts
 bun run test:db
 bun run test:cli
 bun run build:ui

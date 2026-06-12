@@ -30,6 +30,13 @@ interface PreviewItem {
 	meta?: Record<string, unknown>
 }
 
+interface HealthInfo {
+	runtime?: string
+	limits?: {
+		maxPages?: number
+	}
+}
+
 type SourceKind = "" | "youtube" | "twitter" | "gdrive"
 
 interface SourceDef {
@@ -91,6 +98,8 @@ const DEST_OPTIONS = [
 const STATUS_ICON: Record<string, string> = {
 	complete: "✓",
 	running: "○",
+	queued: "○",
+	cancelled: "×",
 	failed: "✕",
 }
 
@@ -122,6 +131,7 @@ export default function Home() {
 	const [loading, setLoading] = useState(false)
 	const [error, setError] = useState("")
 	const [recentPulls, setRecentPulls] = useState<PullSummary[]>([])
+	const [runtimeMaxPages, setRuntimeMaxPages] = useState(2000)
 
 	// Auth/connectivity status per source
 	const [sourceStatuses, setSourceStatuses] = useState<Record<string, SourceStatus>>({})
@@ -205,6 +215,13 @@ export default function Home() {
 		fetchRecent()
 		fetchSourceStatuses()
 		fetchDestStatus()
+		fetch("/api/health", { cache: "no-store" })
+			.then(async (res): Promise<HealthInfo | null> => (res.ok ? ((await res.json()) as HealthInfo) : null))
+			.then((health) => {
+				const limit = health?.limits?.maxPages
+				if (typeof limit === "number" && Number.isFinite(limit) && limit > 0) setRuntimeMaxPages(limit)
+			})
+			.catch(() => {})
 	}, [fetchRecent, fetchSourceStatuses, fetchDestStatus])
 
 	useEffect(() => {
@@ -218,7 +235,8 @@ export default function Home() {
 			fetch("/api/destination-status")
 				.then((r) => r.json())
 				.then((d) => {
-					if (d.gdrive?.authenticated) setGdriveConnected(true)
+					const statuses = d as Record<string, SourceStatus | undefined>
+					if (statuses.gdrive?.authenticated) setGdriveConnected(true)
 				})
 				.catch(() => {})
 		}
@@ -228,7 +246,7 @@ export default function Home() {
 		setConnectingGDrive(true)
 		try {
 			const res = await fetch("/api/auth/gdrive", { method: "POST" })
-			const data = await res.json().catch(() => ({}))
+			const data = (await res.json().catch(() => ({}))) as { ok?: boolean }
 			if (res.ok && data.ok) {
 				setGdriveConnected(true)
 				fetchDriveFolders()
@@ -240,6 +258,18 @@ export default function Home() {
 	}
 
 	const currentSource = SOURCES.find((s) => s.key === source) || SOURCES[0]!
+	const currentSourceStatus = source ? sourceStatuses[source] : null
+	const currentDestStatus = destination ? sourceStatuses[`dest:${destination}`] : null
+	const maxItemsLimit = source ? 500 : runtimeMaxPages
+	const sourceUnavailable =
+		!!source && !!currentSourceStatus && (!currentSourceStatus.installed || !currentSourceStatus.authenticated)
+	const destinationUnavailable =
+		!!destination && !!currentDestStatus && (!currentDestStatus.installed || !currentDestStatus.authenticated)
+	const canStart = !!target.trim() && !sourceUnavailable && !destinationUnavailable
+
+	useEffect(() => {
+		if (maxPages > maxItemsLimit) setMaxPages(maxItemsLimit)
+	}, [maxPages, maxItemsLimit])
 
 	const getHostname = () => {
 		try {
@@ -265,6 +295,14 @@ export default function Home() {
 
 	const handleStart = async () => {
 		if (!target.trim()) return
+		if (sourceUnavailable) {
+			setError(currentSourceStatus?.message || `${currentSource.label} is not available here.`)
+			return
+		}
+		if (destinationUnavailable) {
+			setError(currentDestStatus?.message || "That destination is not available here.")
+			return
+		}
 		setLoading(true)
 		setError("")
 		try {
@@ -272,13 +310,13 @@ export default function Home() {
 				? {
 						source,
 						target: normalizedTarget,
-						maxPages,
+						maxPages: Math.min(maxPages, maxItemsLimit),
 						projectId: projectId || undefined,
 					}
 				: {
 						url: normalizedTarget,
 						outDir: outDir || undefined,
-						maxPages,
+						maxPages: Math.min(maxPages, maxItemsLimit),
 						workerCount: workerCount || undefined,
 						projectId: projectId || undefined,
 					}
@@ -307,7 +345,7 @@ export default function Home() {
 	}
 
 	const handlePreview = async () => {
-		if (!target.trim() || !source) return
+		if (!target.trim() || !source || sourceUnavailable) return
 		setPreviewing(true)
 		setPreviewError("")
 		setPreviewItems(null)
@@ -332,6 +370,11 @@ export default function Home() {
 	}
 
 	const handleSourceChange = (newSource: SourceKind) => {
+		const status = newSource ? sourceStatuses[newSource] : null
+		if (status && (!status.installed || !status.authenticated)) {
+			setError(status.message || "That source is not available here.")
+			return
+		}
 		setSource(newSource)
 		setTarget("")
 		setError("")
@@ -340,6 +383,24 @@ export default function Home() {
 		setMaxPages(newSource ? 100 : 500)
 		setWorkerCount(0)
 	}
+
+	useEffect(() => {
+		if (sourceUnavailable) {
+			setSource("")
+			setTarget("")
+			setPreviewItems(null)
+			setPreviewError("")
+			setError(currentSourceStatus?.message || "That source is not available here.")
+		}
+	}, [sourceUnavailable, currentSourceStatus])
+
+	useEffect(() => {
+		if (destinationUnavailable) {
+			setDestination("")
+			setDestFolder("")
+			setError(currentDestStatus?.message || "That destination is not available here.")
+		}
+	}, [destinationUnavailable, currentDestStatus])
 
 	const hostname = getHostname()
 
@@ -374,6 +435,10 @@ export default function Home() {
 			<div className="source-selector">
 				{SOURCES.map((s) => {
 					const badge = s.key ? getStatusBadge(s.key) : null
+					const disabled =
+						!!s.key &&
+						!!sourceStatuses[s.key] &&
+						(!sourceStatuses[s.key]!.installed || !sourceStatuses[s.key]!.authenticated)
 					return (
 						<button
 							type="button"
@@ -381,6 +446,7 @@ export default function Home() {
 							className={`source-tab ${source === s.key ? "active" : ""}`}
 							onClick={() => handleSourceChange(s.key)}
 							title={badge?.title}
+							disabled={disabled}
 						>
 							<span className="source-tab-icon">{s.icon}</span>
 							{s.label}
@@ -396,6 +462,8 @@ export default function Home() {
 					<div className="dest-options">
 						{DEST_OPTIONS.map((d) => {
 							const badge = d.key ? getDestBadge(d.key) : null
+							const status = d.key ? sourceStatuses[`dest:${d.key}`] : null
+							const disabled = !!d.key && !!status && (!status.installed || !status.authenticated)
 							return (
 								<button
 									type="button"
@@ -403,6 +471,7 @@ export default function Home() {
 									className={`dest-option ${destination === d.key ? "active" : ""}`}
 									onClick={() => setDestination(d.key)}
 									title={badge?.title}
+									disabled={disabled}
 								>
 									<span className="source-tab-icon">{d.icon}</span>
 									{d.label}
@@ -442,7 +511,8 @@ export default function Home() {
 									fetch("/api/destination-status")
 										.then((r) => r.json())
 										.then((d) => {
-											if (!d.gdrive?.authenticated) setGdriveConnected(false)
+											const statuses = d as Record<string, SourceStatus | undefined>
+											if (!statuses.gdrive?.authenticated) setGdriveConnected(false)
 										})
 										.catch(() => {})
 								}}
@@ -525,20 +595,20 @@ export default function Home() {
 					placeholder={currentSource.placeholder}
 					value={target}
 					onChange={(e) => setTarget((e.target as HTMLInputElement).value)}
-					onKeyDown={(e) => e.key === "Enter" && handleStart()}
+					onKeyDown={(e) => e.key === "Enter" && canStart && handleStart()}
 				/>
 				{source && (
 					<button
 						type="button"
 						className="btn btn-secondary"
 						onClick={handlePreview}
-						disabled={previewing || !target.trim()}
+						disabled={previewing || !target.trim() || sourceUnavailable}
 						title="Preview what will be pulled before starting"
 					>
 						{previewing ? <span className="spinner" /> : "Preview"}
 					</button>
 				)}
-				<button type="button" className="btn btn-primary" onClick={handleStart} disabled={loading || !target.trim()}>
+				<button type="button" className="btn btn-primary" onClick={handleStart} disabled={loading || !canStart}>
 					{loading ? <span className="spinner" /> : "Pull"}
 				</button>
 			</div>
@@ -558,7 +628,7 @@ export default function Home() {
 			{source && (
 				<div className="url-preview">
 					{currentSource.label} source · Saves to pulls/ folder in project
-					{destination && " · Dest: Google Drive"}
+					{destination && ` · Dest: ${DEST_OPTIONS.find((d) => d.key === destination)?.label.replace("→ ", "")}`}
 				</div>
 			)}
 
@@ -626,7 +696,7 @@ export default function Home() {
 							<input
 								type="range"
 								min={source ? 5 : 10}
-								max={source ? 500 : 2000}
+								max={maxItemsLimit}
 								step={source ? 5 : 10}
 								value={maxPages}
 								onChange={(e) => setMaxPages(parseInt((e.target as HTMLInputElement).value, 10))}

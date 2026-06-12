@@ -22,10 +22,13 @@ export interface PullEvent {
 
 export function useWebSocket(onEvent: (event: PullEvent) => void) {
 	const wsRef = useRef<WebSocket | null>(null)
+	const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+	const shouldReconnectRef = useRef(true)
 	const onEventRef = useRef(onEvent)
 	onEventRef.current = onEvent
 
 	const connect = useCallback(() => {
+		if (!shouldReconnectRef.current) return
 		const proto = globalThis.location.protocol === "https:" ? "wss:" : "ws:"
 		const ws = new WebSocket(`${proto}//${globalThis.location.host}/ws`)
 
@@ -37,15 +40,33 @@ export function useWebSocket(onEvent: (event: PullEvent) => void) {
 		}
 
 		ws.onclose = () => {
-			setTimeout(connect, 2000)
+			if (!shouldReconnectRef.current) return
+			reconnectTimerRef.current = setTimeout(connect, 2000)
 		}
 
 		wsRef.current = ws
 	}, [])
 
 	useEffect(() => {
-		connect()
-		return () => wsRef.current?.close()
+		shouldReconnectRef.current = true
+		let cancelled = false
+
+		const maybeConnect = async () => {
+			try {
+				const res = await fetch("/api/health", { cache: "no-store" })
+				const health = (await res.json()) as { runtime?: string }
+				if (cancelled || health.runtime === "cloudflare") return
+			} catch {}
+			if (!cancelled) connect()
+		}
+
+		maybeConnect()
+		return () => {
+			cancelled = true
+			shouldReconnectRef.current = false
+			if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current)
+			wsRef.current?.close()
+		}
 	}, [connect])
 
 	return wsRef
