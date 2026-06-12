@@ -56,6 +56,8 @@ const PULL_RATE_LIMIT = 6
 const RATE_WINDOW_SECONDS = 60
 const OWNER_COOKIE = "webpull_owner"
 const DEFAULT_RETENTION_DAYS = 7
+const WIDGET_URI = "ui://webpull/cloudflare-app.html"
+const RESOURCE_MIME_TYPE = "text/html;profile=mcp-app"
 const IGNORED = /\.(png|jpg|jpeg|gif|svg|webp|ico|pdf|zip|tar|gz|mp4|mp3|woff2?|ttf|eot|css|js|json|xml|rss|atom)$/i
 const NAV_SELECTORS = [
 	/<nav[\s\S]*?<\/nav>/gi,
@@ -80,12 +82,62 @@ const CONTENT_SECURITY_POLICY = [
 	"frame-ancestors 'none'",
 ].join("; ")
 
+const MCP_WIDGET_HTML = `<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width,initial-scale=1" />
+		<title>webpull</title>
+		<style>
+			:root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #111318; color: #f4f6fb; }
+			body { margin: 0; padding: 18px; }
+			main { display: grid; gap: 14px; }
+			h1 { margin: 0; font-size: 20px; }
+			p { margin: 0; color: #aab2c0; line-height: 1.5; }
+			button { width: fit-content; border: 1px solid #52658d; border-radius: 8px; background: #233a69; color: white; padding: 9px 12px; font: inherit; cursor: pointer; }
+			pre { white-space: pre-wrap; border: 1px solid #2c3443; border-radius: 8px; padding: 12px; background: #0b0d12; color: #dbe4f7; }
+		</style>
+	</head>
+	<body>
+		<main>
+			<h1>webpull</h1>
+			<p>Pull public websites into markdown on Cloudflare, then publish exports to R2.</p>
+			<button id="load">Load recent pulls</button>
+			<pre id="out">Ready.</pre>
+		</main>
+		<script>
+			const out = document.getElementById("out");
+			document.getElementById("load").addEventListener("click", async () => {
+				try {
+					const result = await window.openai.callTool("webpull_list_pulls", { limit: 10 });
+					out.textContent = JSON.stringify(result.structuredContent || result, null, 2);
+				} catch (error) {
+					out.textContent = String(error && error.message ? error.message : error);
+				}
+			});
+		</script>
+	</body>
+</html>`
+
 function json(data: unknown, status = 200): Response {
 	return new Response(JSON.stringify(data), {
 		status,
 		headers: {
 			"content-type": "application/json",
 			"cache-control": "no-store",
+		},
+	})
+}
+
+function mcpJson(data: unknown, status = 200): Response {
+	return new Response(JSON.stringify(data), {
+		status,
+		headers: {
+			"content-type": "application/json",
+			"cache-control": "no-store",
+			"access-control-allow-origin": "*",
+			"access-control-allow-methods": "GET, POST, DELETE, OPTIONS",
+			"access-control-allow-headers": "content-type, mcp-protocol-version, mcp-session-id",
 		},
 	})
 }
@@ -103,6 +155,48 @@ function withSecurityHeaders(response: Response): Response {
 		headers.set("content-security-policy", CONTENT_SECURITY_POLICY)
 	}
 	return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
+}
+
+function toolText(text: string) {
+	return [{ type: "text", text }]
+}
+
+function pullSummary(pull: PullRow) {
+	return {
+		id: pull.id,
+		url: pull.url,
+		status: pull.status,
+		pagesOk: pull.pages_ok,
+		pagesErr: pull.pages_err,
+		outDir: pull.out_dir,
+		startedAt: pull.started_at,
+		finishedAt: pull.finished_at,
+	}
+}
+
+function docSummary(doc: DocRow) {
+	return {
+		id: doc.id,
+		pullId: doc.pull_id,
+		path: doc.path,
+		url: doc.url,
+		title: doc.title || doc.path,
+		preview: doc.content.length <= 700 ? doc.content : `${doc.content.slice(0, 700)}\n\n...truncated`,
+	}
+}
+
+function mcpTool(name: string, title: string, description: string, inputSchema: Record<string, unknown>) {
+	return {
+		name,
+		title,
+		description,
+		inputSchema,
+		_meta: {
+			ui: { resourceUri: WIDGET_URI },
+			"ui/resourceUri": WIDGET_URI,
+			"openai/outputTemplate": WIDGET_URI,
+		},
+	}
 }
 
 function parseCookies(request: Request): Record<string, string> {
@@ -898,9 +992,261 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
 	return error("Not found", 404)
 }
 
+function mcpTools() {
+	return [
+		mcpTool("webpull_open_app", "Open webpull app", "Open the deployed webpull Cloudflare app widget.", {
+			type: "object",
+			properties: { limit: { type: "number", minimum: 1, maximum: 50 } },
+		}),
+		mcpTool("webpull_list_pulls", "List webpull pulls", "List recent website pulls owned by this MCP session.", {
+			type: "object",
+			properties: { limit: { type: "number", minimum: 1, maximum: 50 } },
+		}),
+		mcpTool("webpull_start_pull", "Start webpull pull", "Start pulling a public website into markdown on Cloudflare.", {
+			type: "object",
+			properties: {
+				url: { type: "string", description: "Public website or docs URL to pull." },
+				maxPages: { type: "number", minimum: 1, maximum: MAX_CLOUD_PAGES },
+			},
+			required: ["url"],
+		}),
+		mcpTool("webpull_show_pull", "Show webpull pull", "Show one pull and its markdown documents.", {
+			type: "object",
+			properties: {
+				pullId: { type: "string" },
+				limit: { type: "number", minimum: 1, maximum: 50 },
+			},
+			required: ["pullId"],
+		}),
+		mcpTool("search", "Search pulled markdown", "Search markdown documents owned by this MCP session.", {
+			type: "object",
+			properties: {
+				query: { type: "string" },
+				pullId: { type: "string" },
+				limit: { type: "number", minimum: 1, maximum: 20 },
+			},
+			required: ["query"],
+		}),
+		mcpTool("fetch", "Fetch pulled markdown document", "Fetch exact markdown for a document returned by search.", {
+			type: "object",
+			properties: { id: { type: "number", minimum: 1 } },
+			required: ["id"],
+		}),
+	]
+}
+
+function mcpResult(id: unknown, result: unknown): Response {
+	return mcpJson({ jsonrpc: "2.0", id, result })
+}
+
+function mcpError(id: unknown, message: string, code = -32000): Response {
+	return mcpJson({ jsonrpc: "2.0", id, error: { code, message } })
+}
+
+async function listOwnedPulls(env: Env, ownerKey: string, limit: number): Promise<PullRow[]> {
+	const rows = await env.DB.prepare(
+		`SELECT pulls.*
+		 FROM pulls
+		 JOIN pull_owners ON pull_owners.pull_id = pulls.id
+		 WHERE pull_owners.owner_key = ?
+		 ORDER BY pulls.started_at DESC
+		 LIMIT ?`,
+	)
+		.bind(ownerKey, Math.max(1, Math.min(limit, 50)))
+		.all<PullRow>()
+	return rows.results
+}
+
+async function callMcpTool(
+	request: Request,
+	env: Env,
+	owner: { key: string; isNew: boolean },
+	name: string,
+	args: Record<string, unknown>,
+): Promise<Response> {
+	if (name === "webpull_open_app" || name === "webpull_list_pulls") {
+		const pulls = (await listOwnedPulls(env, owner.key, Number(args.limit || 20))).map(pullSummary)
+		return withOwnerCookie(
+			mcpJson({
+				structuredContent: { pulls },
+				content: toolText(name === "webpull_open_app" ? "Opened the webpull app." : `Found ${pulls.length} pull(s).`),
+			}),
+			owner,
+		)
+	}
+
+	if (name === "webpull_start_pull") {
+		const limited = await checkRateLimit(env, request)
+		if (limited) return limited
+		const normalized = normalizeUrl(String(args.url ?? ""))
+		if (!normalized) return mcpJson({ content: toolText("Valid url is required"), isError: true }, 400)
+		const maxPages = Math.max(1, Math.min(Number(args.maxPages || MAX_CLOUD_PAGES), MAX_CLOUD_PAGES))
+		const pullId = crypto.randomUUID()
+		await env.DB.prepare(
+			`INSERT INTO pulls (id, url, out_dir, max_pages, worker_count, status, pages_ok, pages_err, started_at)
+			 VALUES (?, ?, ?, ?, ?, 'queued', 0, 0, datetime('now'))`,
+		)
+			.bind(pullId, normalized, `./${new URL(normalized).hostname}`, maxPages, CONCURRENCY)
+			.run()
+		await env.DB.prepare("INSERT INTO pull_owners (pull_id, owner_key) VALUES (?, ?)").bind(pullId, owner.key).run()
+		await env.PULL_QUEUE.send({ pullId, url: normalized, maxPages } satisfies PullJob)
+		const pull = await env.DB.prepare("SELECT * FROM pulls WHERE id = ?").bind(pullId).first<PullRow>()
+		return withOwnerCookie(
+			mcpJson({
+				structuredContent: { pull: pull ? pullSummary(pull) : { id: pullId, url: normalized, status: "queued" } },
+				content: toolText(`Started pulling ${normalized}. Use webpull_show_pull to check status.`),
+			}),
+			owner,
+		)
+	}
+
+	if (name === "webpull_show_pull") {
+		const pullId = String(args.pullId || "")
+		if (!pullId || !(await ownsPull(env, pullId, owner.key)))
+			return mcpJson({ content: toolText("Pull not found"), isError: true }, 404)
+		const pull = await env.DB.prepare("SELECT * FROM pulls WHERE id = ?").bind(pullId).first<PullRow>()
+		if (!pull) return mcpJson({ content: toolText("Pull not found"), isError: true }, 404)
+		const docs = (await getPullDocs(env, pullId)).slice(0, Math.max(1, Math.min(Number(args.limit || 20), 50)))
+		return mcpJson({
+			structuredContent: { pull: pullSummary(pull), results: docs.map(docSummary), selectedPullId: pull.id },
+			content: toolText(`${pull.status} pull for ${pull.url}: ${pull.pages_ok} ok, ${pull.pages_err} errors.`),
+		})
+	}
+
+	if (name === "search") {
+		const query = String(args.query || "").trim()
+		if (!query) return mcpJson({ content: toolText("query is required"), isError: true }, 400)
+		const limit = Math.max(1, Math.min(Number(args.limit || 10), 20))
+		const q = `%${query}%`
+		const pullId = args.pullId ? String(args.pullId) : ""
+		if (pullId && !(await ownsPull(env, pullId, owner.key)))
+			return mcpJson({ content: toolText("Pull not found"), isError: true }, 404)
+		const docs = pullId
+			? await env.DB.prepare(
+					"SELECT id, pull_id, path, url, title, content FROM documents WHERE pull_id = ? AND (title LIKE ? OR content LIKE ?) ORDER BY path LIMIT ?",
+				)
+					.bind(pullId, q, q, limit)
+					.all<DocRow>()
+			: await env.DB.prepare(
+					`SELECT documents.id, documents.pull_id, documents.path, documents.url, documents.title, documents.content
+					 FROM documents
+					 JOIN pull_owners ON pull_owners.pull_id = documents.pull_id
+					 WHERE pull_owners.owner_key = ? AND (documents.title LIKE ? OR documents.content LIKE ?)
+					 ORDER BY documents.created_at DESC
+					 LIMIT ?`,
+				)
+					.bind(owner.key, q, q, limit)
+					.all<DocRow>()
+		const results = docs.results.map(docSummary)
+		return mcpJson({
+			structuredContent: { results, selectedPullId: pullId || null },
+			content: toolText(`Found ${results.length} matching document${results.length === 1 ? "" : "s"}.`),
+		})
+	}
+
+	if (name === "fetch") {
+		const id = Number(args.id)
+		const doc = await env.DB.prepare(
+			`SELECT documents.id, documents.pull_id, documents.path, documents.url, documents.title, documents.content
+			 FROM documents
+			 JOIN pull_owners ON pull_owners.pull_id = documents.pull_id
+			 WHERE pull_owners.owner_key = ? AND documents.id = ?`,
+		)
+			.bind(owner.key, id)
+			.first<DocRow>()
+		if (!doc) return mcpJson({ content: toolText("Document not found"), isError: true }, 404)
+		return mcpJson({
+			structuredContent: { document: doc },
+			content: toolText(`Fetched ${doc.title || doc.path} from ${doc.url}.\n\n${doc.content}`),
+			_meta: { fullLength: doc.content.length },
+		})
+	}
+
+	return mcpJson({ content: toolText(`Unknown tool: ${name}`), isError: true }, 404)
+}
+
+function mcpLandingHtml(): string {
+	return `<!doctype html>
+<html lang="en">
+	<head><meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" /><title>webpull MCP</title></head>
+	<body>
+		<main>
+			<h1>webpull MCP endpoint</h1>
+			<p>This Cloudflare endpoint supports the deployed webpull MCP tools for website pulls and R2-backed markdown archives.</p>
+			<p>Use <code>webpull_open_app</code> from ChatGPT or Codex to open the embedded app UI.</p>
+		</main>
+	</body>
+</html>`
+}
+
+async function handleMcp(request: Request, env: Env): Promise<Response> {
+	if (request.method === "OPTIONS") return mcpJson(null, 204)
+	if (request.method === "GET") {
+		const accept = request.headers.get("accept") ?? ""
+		if (accept.includes("text/html") && !accept.includes("text/event-stream")) {
+			return new Response(mcpLandingHtml(), {
+				headers: {
+					"content-type": "text/html; charset=utf-8",
+					"access-control-allow-origin": "*",
+				},
+			})
+		}
+	}
+	if (request.method !== "POST") return mcpError(null, "Method not allowed", -32600)
+
+	const owner = getOwnerKey(request)
+	const rpc = (await request.json().catch(() => null)) as {
+		id?: unknown
+		method?: string
+		params?: Record<string, unknown>
+	} | null
+	if (!rpc?.method) return mcpError(null, "Invalid request", -32600)
+	const id = rpc.id ?? null
+
+	if (rpc.method === "initialize") {
+		return mcpResult(id, {
+			protocolVersion: "2025-06-18",
+			capabilities: { tools: {}, resources: {} },
+			serverInfo: { name: "webpull-cloudflare", version: "0.1.3" },
+			instructions:
+				"Use webpull to pull public websites into markdown on Cloudflare, search owned markdown archives, and fetch exact documents.",
+		})
+	}
+	if (rpc.method === "tools/list") return mcpResult(id, { tools: mcpTools() })
+	if (rpc.method === "resources/read") {
+		if (rpc.params?.uri !== WIDGET_URI) return mcpError(id, "Resource not found", -32004)
+		return mcpResult(id, {
+			contents: [
+				{
+					uri: WIDGET_URI,
+					mimeType: RESOURCE_MIME_TYPE,
+					text: MCP_WIDGET_HTML,
+					_meta: { ui: { prefersBorder: true } },
+				},
+			],
+		})
+	}
+	if (rpc.method === "tools/call") {
+		const params = rpc.params ?? {}
+		const result = await callMcpTool(
+			request,
+			env,
+			owner,
+			String(params.name || ""),
+			(params.arguments ?? {}) as Record<string, unknown>,
+		)
+		const body = await result.json().catch(() => ({}))
+		const response = mcpResult(id, body)
+		return withOwnerCookie(response, owner)
+	}
+	if (rpc.method.startsWith("notifications/")) return new Response(null, { status: 202 })
+	return mcpError(id, `Unknown method: ${rpc.method}`, -32601)
+}
+
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
 		const url = new URL(request.url)
+		if (url.pathname === "/mcp") return withSecurityHeaders(await handleMcp(request, env))
 		if (url.pathname.startsWith("/api/") || url.pathname === "/ws")
 			return withSecurityHeaders(await handleApi(request, env))
 		return withSecurityHeaders(await env.ASSETS.fetch(request))
