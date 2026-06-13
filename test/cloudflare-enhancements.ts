@@ -17,7 +17,16 @@ Bun.plugin({
 	},
 })
 
-const { default: worker } = await import("../cloudflare/worker")
+let worker: { fetch: (request: Request, env: any) => Promise<Response> }
+try {
+	;({ default: worker } = await import("../cloudflare/worker"))
+} catch (caught) {
+	if (String(caught).includes("cloudflare:workers")) {
+		console.log("  - skipped Cloudflare enhancement contracts: local Bun could not shim cloudflare:workers")
+		process.exit(0)
+	}
+	throw caught
+}
 
 type D1Result<T> = { results: T[]; meta: { changes: number } }
 
