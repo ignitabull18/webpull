@@ -27,6 +27,34 @@ interface PushResult {
 	files: { path: string; status: string; error?: string }[]
 }
 
+interface WorkflowStep {
+	id?: number
+	name: string
+	status: string
+	detail?: string
+	started_at?: string
+	finished_at?: string | null
+}
+
+interface WorkflowStatus {
+	status?: string
+	executor?: string
+	workflow_id?: string
+	steps?: WorkflowStep[]
+}
+
+interface BrowserDiagnostic {
+	id?: number
+	url: string
+	mode: string
+	status: string
+	session_id?: string | null
+	live_view_url?: string | null
+	recording_url?: string | null
+	detail?: string
+	created_at?: string
+}
+
 function buildTree(docs: Doc[]): TreeNode[] {
 	const root: TreeNode[] = []
 	for (const doc of docs) {
@@ -95,6 +123,9 @@ export default function Pull() {
 	const [pushResult, setPushResult] = useState<PushResult | null>(null)
 	const [pushError, setPushError] = useState("")
 	const destIntent = useRef<any>(null)
+	const [workflow, setWorkflow] = useState<WorkflowStatus | null>(null)
+	const [browserDiagnostics, setBrowserDiagnostics] = useState<BrowserDiagnostic[]>([])
+	const [diagnosticsChecked, setDiagnosticsChecked] = useState(false)
 
 	useEffect(() => {
 		// Check for destination intent from sessionStorage
@@ -184,9 +215,11 @@ export default function Pull() {
 
 		const poll = async () => {
 			try {
-				const [pullRes, docsRes] = await Promise.all([
+				const [pullRes, docsRes, workflowRes, browserRes] = await Promise.all([
 					fetch(`/api/pulls/${pullId}`),
 					fetch(`/api/pulls/${pullId}/docs`),
+					fetch(`/api/pulls/${pullId}/workflow`),
+					fetch(`/api/pulls/${pullId}/browser-events`),
 				])
 				if (cancelled) return
 				if (pullRes.ok) {
@@ -227,6 +260,15 @@ export default function Pull() {
 						return next
 					})
 				}
+				if (workflowRes.ok) {
+					const data = (await workflowRes.json()) as WorkflowStatus | WorkflowStep[]
+					setWorkflow(Array.isArray(data) ? { steps: data } : data)
+				}
+				if (browserRes.ok) {
+					const data = (await browserRes.json()) as BrowserDiagnostic[] | { events?: BrowserDiagnostic[] }
+					setBrowserDiagnostics(Array.isArray(data) ? data : (data.events ?? []))
+				}
+				setDiagnosticsChecked(true)
 			} catch {}
 		}
 
@@ -339,6 +381,39 @@ export default function Pull() {
 						? "Cancelled"
 						: "Failed"
 
+	const fallbackWorkflowSteps = useMemo<WorkflowStep[]>(() => {
+		const activeStep =
+			state.status === "discovering" ? "Discover pages" : state.status === "running" ? "Pull content" : ""
+		return [
+			{
+				name: "Discover pages",
+				status:
+					state.status === "discovering"
+						? "running"
+						: state.ok + state.err > 0 || state.status === "complete"
+							? "complete"
+							: "queued",
+			},
+			{
+				name: "Pull content",
+				status:
+					state.status === "running"
+						? "running"
+						: state.status === "complete"
+							? "complete"
+							: activeStep === "Discover pages"
+								? "queued"
+								: state.status,
+				detail: state.total ? `${state.ok + state.err} of ${state.total}` : "",
+			},
+			{
+				name: "Save markdown",
+				status: state.status === "complete" ? "complete" : state.status === "error" ? "error" : "queued",
+				detail: docs.length ? `${docs.length} documents ready` : "",
+			},
+		]
+	}, [docs.length, state.err, state.ok, state.status, state.total])
+
 	const renderTree = (nodes: TreeNode[], depth = 0) => {
 		return nodes.map((node) => (
 			<React.Fragment key={node.path}>
@@ -428,6 +503,65 @@ export default function Pull() {
 					<span>
 						<strong>{state.elapsed.toFixed(1)}</strong>s
 					</span>
+				</div>
+
+				<div className="diagnostics-section">
+					<div className="diagnostics-section-header">
+						<span>Workflow</span>
+						{workflow?.executor && <span className="diagnostics-muted">{workflow.executor}</span>}
+					</div>
+					<div className="workflow-steps">
+						{(workflow?.steps?.length ? workflow.steps : fallbackWorkflowSteps).map((step, index) => (
+							<div key={`${step.id ?? index}-${step.name}`} className="workflow-step">
+								<span className={`workflow-step-dot status-${step.status === "error" ? "failed" : step.status}`} />
+								<div className="workflow-step-body">
+									<span className="workflow-step-name">{step.name}</span>
+									{step.detail && <span className="workflow-step-detail">{step.detail}</span>}
+								</div>
+							</div>
+						))}
+					</div>
+				</div>
+
+				<div className="diagnostics-section">
+					<div className="diagnostics-section-header">
+						<span>Browser diagnostics</span>
+						{diagnosticsChecked && <span className="diagnostics-muted">{browserDiagnostics.length || "none"}</span>}
+					</div>
+					{browserDiagnostics.length > 0 ? (
+						<div className="browser-diagnostics-list">
+							{browserDiagnostics.slice(0, 4).map((event, index) => (
+								<div key={`${event.id ?? index}-${event.url}`} className="browser-diagnostic-item">
+									<div className="browser-diagnostic-title">
+										<span className={`status-badge status-${event.status === "error" ? "failed" : event.status}`}>
+											{event.status}
+										</span>
+										<span>{event.mode}</span>
+									</div>
+									<div className="browser-diagnostic-url">{event.url}</div>
+									{event.detail && <div className="browser-diagnostic-detail">{event.detail}</div>}
+									{(event.live_view_url || event.recording_url) && (
+										<div className="browser-diagnostic-links">
+											{event.live_view_url && (
+												<a href={event.live_view_url} target="_blank" rel="noreferrer">
+													Live
+												</a>
+											)}
+											{event.recording_url && (
+												<a href={event.recording_url} target="_blank" rel="noreferrer">
+													Recording
+												</a>
+											)}
+										</div>
+									)}
+								</div>
+							))}
+						</div>
+					) : (
+						<div className="diagnostics-empty">
+							{diagnosticsChecked ? "No browser runs recorded." : "Checking browser runs…"}
+						</div>
+					)}
 				</div>
 
 				{(state.status === "discovering" || state.status === "running") && (

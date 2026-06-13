@@ -1,7 +1,11 @@
+import { WorkflowEntrypoint } from "cloudflare:workers"
+import { Agent, routeAgentRequest } from "agents"
+
 interface PullRow {
 	id: string
 	url: string
 	source: string
+	source_id?: string | null
 	dest: string
 	project_id: string | null
 	out_dir: string
@@ -40,6 +44,7 @@ interface HealthResponse {
 		maxPages: number
 		concurrency: number
 	}
+	capabilities?: Record<string, CapabilityStatus>
 }
 
 interface DocRow {
@@ -59,6 +64,87 @@ interface CloudSourceItem {
 	meta?: Record<string, unknown>
 }
 
+interface CapabilityStatus {
+	enabled: boolean
+	configured: boolean
+	available: boolean
+	setupRequired: boolean
+	message: string
+}
+
+interface WorkflowStepRow {
+	id: number
+	name: string
+	status: string
+	detail: string
+	started_at: string
+	finished_at: string | null
+}
+
+interface BrowserRunEventRow {
+	id: number
+	url: string
+	mode: string
+	status: string
+	session_id: string | null
+	live_view_url: string | null
+	recording_url: string | null
+	detail: string
+	created_at: string
+}
+
+interface KnowledgeBucketRow {
+	id: string
+	owner_key: string
+	name: string
+	created_at: string
+	updated_at: string
+}
+
+interface SavedSourceRow {
+	id: string
+	owner_key: string
+	project_id: string | null
+	name: string
+	url: string
+	source: string
+	target: string
+	cadence: string
+	status: string
+	config_json: string
+	last_pull_id: string | null
+	last_refreshed_at: string | null
+	next_refresh_at: string | null
+	created_at: string
+	updated_at: string
+}
+
+interface AskResponse {
+	answer: string
+	mode: "keyword" | "semantic" | "hybrid"
+	setupRequired: boolean
+	results: ReturnType<typeof docSummary>[]
+}
+
+type FeatureKey = "workflows" | "aiSearch" | "browserRecording" | "artifacts" | "secrets" | "aiGateway" | "agents"
+type SearchMode = "keyword" | "semantic" | "hybrid" | "ai"
+type AiSearchNamespaceBinding = {
+	create?: (options: Record<string, unknown>) => Promise<unknown>
+	get?: (id: string) => {
+		items?: {
+			list?: (options?: Record<string, unknown>) => Promise<unknown>
+			upload?: (path: string, content: string, options?: Record<string, unknown>) => Promise<unknown>
+			uploadAndPoll?: (path: string, content: string, options?: Record<string, unknown>) => Promise<unknown>
+		}
+		info?: () => Promise<unknown>
+		stats?: () => Promise<unknown>
+		search?: (options: Record<string, unknown>) => Promise<unknown>
+	}
+	list?: (options?: Record<string, unknown>) => Promise<unknown>
+	delete?: (id: string) => Promise<unknown>
+	search?: (options: Record<string, unknown>) => Promise<unknown>
+}
+
 const MAX_CLOUD_PAGES = 50
 const CONCURRENCY = 6
 const MAX_RETRIES = 2
@@ -68,6 +154,15 @@ const OWNER_COOKIE = "webpull_owner"
 const DEFAULT_RETENTION_DAYS = 7
 const WIDGET_URI = "ui://webpull/cloudflare-app.html"
 const RESOURCE_MIME_TYPE = "text/html;profile=mcp-app"
+const FEATURE_FLAGS: Record<FeatureKey, string> = {
+	workflows: "WEBPULL_WORKFLOWS_ENABLED",
+	aiSearch: "WEBPULL_AI_SEARCH_ENABLED",
+	browserRecording: "WEBPULL_BROWSER_RECORDING_ENABLED",
+	artifacts: "WEBPULL_ARTIFACTS_ENABLED",
+	secrets: "WEBPULL_SECRETS_ENABLED",
+	aiGateway: "WEBPULL_AI_GATEWAY_ENABLED",
+	agents: "WEBPULL_AGENTS_SDK_ENABLED",
+}
 const IGNORED = /\.(png|jpg|jpeg|gif|svg|webp|ico|pdf|zip|tar|gz|mp4|mp3|woff2?|ttf|eot|css|js|json|xml|rss|atom)$/i
 const NAV_SELECTORS = [
 	/<nav[\s\S]*?<\/nav>/gi,
@@ -81,10 +176,10 @@ const SECURITY_HEADERS = {
 }
 const CONTENT_SECURITY_POLICY = [
 	"default-src 'self'",
-	"script-src 'self'",
+	"script-src 'self' 'unsafe-inline' https://static.cloudflareinsights.com",
 	"style-src 'self' 'unsafe-inline'",
 	"img-src 'self' https: data:",
-	"connect-src 'self' ws: wss:",
+	"connect-src 'self' ws: wss: https://cloudflareinsights.com",
 	"font-src 'self' data:",
 	"object-src 'none'",
 	"base-uri 'self'",
@@ -165,6 +260,138 @@ function withSecurityHeaders(response: Response): Response {
 		headers.set("content-security-policy", CONTENT_SECURITY_POLICY)
 	}
 	return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
+}
+
+function envRecord(env: Env): Record<string, unknown> {
+	return env as unknown as Record<string, unknown>
+}
+
+function flagEnabled(env: Env, key: FeatureKey): boolean {
+	const value = String(envRecord(env)[FEATURE_FLAGS[key]] ?? "").toLowerCase()
+	return value === "1" || value === "true" || value === "yes" || value === "on"
+}
+
+function hasBinding(env: Env, binding: string): boolean {
+	return envRecord(env)[binding] !== undefined && envRecord(env)[binding] !== null
+}
+
+function capability(
+	env: Env,
+	key: FeatureKey,
+	binding: string | null,
+	enabledMessage: string,
+	setupMessage: string,
+): CapabilityStatus {
+	const enabled = flagEnabled(env, key)
+	const configured = binding ? hasBinding(env, binding) : enabled
+	const available = enabled && configured
+	return {
+		enabled,
+		configured,
+		available,
+		setupRequired: enabled && !configured,
+		message: available ? enabledMessage : enabled ? setupMessage : "Disabled by feature flag.",
+	}
+}
+
+function blockedCapability(message: string): CapabilityStatus {
+	return {
+		enabled: false,
+		configured: false,
+		available: false,
+		setupRequired: true,
+		message,
+	}
+}
+
+function getCapabilities(env: Env): Record<FeatureKey, CapabilityStatus> {
+	const artifactsBlockedReason = String(envRecord(env).WEBPULL_ARTIFACTS_BLOCKED_REASON || "")
+	return {
+		workflows: capability(
+			env,
+			"workflows",
+			"PULL_WORKFLOW",
+			"Cloudflare Workflows will run pull orchestration.",
+			"Add a PULL_WORKFLOW binding and export PullWorkflow.",
+		),
+		aiSearch: capability(
+			env,
+			"aiSearch",
+			"AI_SEARCH",
+			"AI Search semantic and hybrid search are available.",
+			"Add an AI_SEARCH namespace binding.",
+		),
+		browserRecording: capability(
+			env,
+			"browserRecording",
+			"BROWSER",
+			"Browser Run diagnostics can record opt-in render metadata.",
+			"Add the BROWSER binding.",
+		),
+		artifacts: artifactsBlockedReason
+			? blockedCapability(artifactsBlockedReason)
+			: capability(env, "artifacts", "ARTIFACTS", "Artifacts publishing is available.", "Add an ARTIFACTS binding."),
+		secrets: capability(
+			env,
+			"secrets",
+			"OPENAI_API_KEY",
+			"Secrets Store bindings are available for provider credentials.",
+			"Add Secrets Store bindings for provider credentials.",
+		),
+		aiGateway: capability(
+			env,
+			"aiGateway",
+			"AI",
+			"AI Gateway-routed model calls are available.",
+			"Add an AI binding and gateway id.",
+		),
+		agents: capability(
+			env,
+			"agents",
+			"WEBPULL_AGENT",
+			"Agent sessions are available.",
+			"Add Agents SDK Durable Object bindings.",
+		),
+	}
+}
+
+function isCapabilityAvailable(env: Env, key: FeatureKey): boolean {
+	return getCapabilities(env)[key].available
+}
+
+function normalizeSearchMode(raw: string | null): SearchMode {
+	return raw === "semantic" || raw === "hybrid" || raw === "ai" ? raw : "keyword"
+}
+
+function capabilityResponse(env: Env) {
+	const capabilities = getCapabilities(env)
+	const flags = Object.fromEntries(
+		(Object.keys(FEATURE_FLAGS) as FeatureKey[]).map((key) => [key, flagEnabled(env, key)]),
+	) as Record<FeatureKey, boolean>
+	const binding = (status: CapabilityStatus) => ({
+		configured: status.configured,
+		available: status.available,
+		status: status.available ? "ready" : "setup-required",
+		message: status.message,
+	})
+	return {
+		runtime: "cloudflare",
+		featureFlags: {
+			provider: "fallback",
+			enabled: Object.values(flags).some(Boolean),
+			flags,
+		},
+		capabilities,
+		bindings: {
+			workflows: binding(capabilities.workflows),
+			aiSearch: binding(capabilities.aiSearch),
+			browserRecording: binding(capabilities.browserRecording),
+			artifacts: binding(capabilities.artifacts),
+			secretsStore: binding(capabilities.secrets),
+			aiGateway: binding(capabilities.aiGateway),
+			agents: binding(capabilities.agents),
+		},
+	}
 }
 
 function toolText(text: string) {
@@ -458,18 +685,38 @@ export function htmlToMarkdown(html: string, url: string): { title: string; cont
 	}
 }
 
-async function browserMarkdown(env: Env, url: string): Promise<string | null> {
+async function browserMarkdown(env: Env, url: string, pullId?: string): Promise<string | null> {
 	try {
+		if (pullId && flagEnabled(env, "browserRecording")) {
+			await recordBrowserRunEvent(
+				env,
+				pullId,
+				url,
+				"quick-action",
+				isCapabilityAvailable(env, "browserRecording") ? "recording-requested" : "setup-required",
+				isCapabilityAvailable(env, "browserRecording")
+					? "Browser Run markdown quick action used; session recording is tracked when Browser Sessions are configured."
+					: getCapabilities(env).browserRecording.message,
+			)
+		}
 		const response = await env.BROWSER.quickAction("markdown", {
 			url,
 			gotoOptions: { waitUntil: "networkidle0", timeout: 20000 },
 		})
-		if (!response.ok) return null
+		if (!response.ok) {
+			if (pullId) await recordBrowserRunEvent(env, pullId, url, "quick-action", "failed", `HTTP ${response.status}`)
+			return null
+		}
 		const data = (await response.json().catch(() => null)) as { success?: boolean; result?: string } | null
-		if (!data?.result || !data.success) return null
+		if (!data?.result || !data.success) {
+			if (pullId) await recordBrowserRunEvent(env, pullId, url, "quick-action", "failed", "No markdown result")
+			return null
+		}
+		if (pullId) await recordBrowserRunEvent(env, pullId, url, "quick-action", "complete", "Markdown extracted")
 		return normalizeText(data.result)
 	} catch (err) {
 		console.log(JSON.stringify({ level: "warn", event: "browser_markdown_failed", url, error: String(err) }))
+		if (pullId) await recordBrowserRunEvent(env, pullId, url, "quick-action", "failed", String(err))
 		return null
 	}
 }
@@ -484,11 +731,16 @@ async function withRetry<T>(operation: () => Promise<T | null>): Promise<T | nul
 	return last
 }
 
-async function convertPage(env: Env, html: string, url: string): Promise<{ title: string; content: string } | null> {
+async function convertPage(
+	env: Env,
+	html: string,
+	url: string,
+	pullId?: string,
+): Promise<{ title: string; content: string } | null> {
 	const staticResult = htmlToMarkdown(html, url)
 	if (!isWeakMarkdown(staticResult.content)) return staticResult
 
-	const rendered = await browserMarkdown(env, url)
+	const rendered = await browserMarkdown(env, url, pullId)
 	if (rendered && rendered.split(/\s+/).filter(Boolean).length >= 12) {
 		const title = staticResult.title
 		return { title, content: `${frontmatter(title, url, "browser-run")}${rendered}\n` }
@@ -606,19 +858,35 @@ async function discoverPages(url: string, max: number): Promise<string[]> {
 	return extractLinks(baseFetch.text, actual, scope).slice(0, max)
 }
 
-async function runCloudPull(env: Env, pullId: string, url: string, maxPages: number): Promise<void> {
+async function runCloudPull(
+	env: Env,
+	pullId: string,
+	url: string,
+	maxPages: number,
+	executor = "queue",
+): Promise<void> {
 	let ok = 0
 	let err = 0
 	try {
+		await recordWorkflowRun(env, pullId, executor, "running")
+		await recordWorkflowStep(env, pullId, "discover", "running", url)
 		const urls = await discoverPages(url, maxPages)
+		await recordWorkflowStep(env, pullId, "discover", "complete", `${urls.length} URL(s) discovered`)
 		for (let index = 0; index < urls.length; index += CONCURRENCY) {
 			if (await isPullCancelled(env, pullId)) return
 			const batch = urls.slice(index, index + CONCURRENCY)
+			await recordWorkflowStep(
+				env,
+				pullId,
+				"fetch-convert",
+				"running",
+				`${index + 1}-${index + batch.length} of ${urls.length}`,
+			)
 			const docs = await Promise.all(
 				batch.map(async (docUrl) => {
 					const fetched = await fetchTextWithRetry(docUrl)
 					if (!fetched) return { url: docUrl, error: "Failed to fetch page after retries" }
-					const converted = await withRetry(() => convertPage(env, fetched.text, fetched.url))
+					const converted = await withRetry(() => convertPage(env, fetched.text, fetched.url, pullId))
 					if (!converted) return { url: fetched.url, error: "No extractable markdown content after retries" }
 					return {
 						doc: {
@@ -660,17 +928,28 @@ async function runCloudPull(env: Env, pullId: string, url: string, maxPages: num
 			}
 			if (statements.length > 0) await env.DB.batch(statements)
 			await env.DB.prepare("UPDATE pulls SET pages_ok = ?, pages_err = ? WHERE id = ?").bind(ok, err, pullId).run()
+			await recordWorkflowStep(env, pullId, "fetch-convert", "complete", `${ok} ok, ${err} err`)
 		}
 		if (await isPullCancelled(env, pullId)) return
 		const status = ok > 0 && err === 0 ? "complete" : ok > 0 ? "partial" : "failed"
+		await refreshAiSearchIndex(env, pullId, status)
 		await env.DB.prepare(
 			"UPDATE pulls SET status = ?, pages_ok = ?, pages_err = ?, finished_at = datetime('now') WHERE id = ?",
 		)
 			.bind(status, ok, err, pullId)
 			.run()
+		await recordWorkflowStep(
+			env,
+			pullId,
+			"index",
+			isCapabilityAvailable(env, "aiSearch") ? "complete" : "skipped",
+			getCapabilities(env).aiSearch.message,
+		)
+		await recordWorkflowRun(env, pullId, executor, status)
 	} catch (caught) {
 		if (await isPullCancelled(env, pullId)) return
 		const reason = caught instanceof Error ? caught.message : String(caught)
+		await recordWorkflowStep(env, pullId, "pull", "failed", reason)
 		await env.DB.prepare("INSERT INTO page_failures (pull_id, url, reason) VALUES (?, ?, ?)")
 			.bind(pullId, url, reason)
 			.run()
@@ -679,6 +958,7 @@ async function runCloudPull(env: Env, pullId: string, url: string, maxPages: num
 		)
 			.bind(ok, err + 1, pullId)
 			.run()
+		await recordWorkflowRun(env, pullId, executor, "failed")
 	}
 }
 
@@ -836,6 +1116,577 @@ async function fetchJson<T>(url: string): Promise<T | null> {
 	return (await fetched.json().catch(() => null)) as T | null
 }
 
+let enhancementSchemaChecked = false
+
+async function ensureEnhancementSchema(env: Env): Promise<void> {
+	if (enhancementSchemaChecked) return
+	const executor = (env.DB as unknown as { exec?: (sql: string) => Promise<unknown> | unknown }).exec
+	if (!executor) return
+	try {
+		for (const statement of [
+			"ALTER TABLE pulls ADD COLUMN source_id TEXT",
+			"ALTER TABLE documents ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''",
+			"ALTER TABLE documents ADD COLUMN change_status TEXT NOT NULL DEFAULT 'new'",
+		]) {
+			try {
+				await executor.call(env.DB, statement)
+			} catch {}
+		}
+		await executor.call(
+			env.DB,
+			`
+		CREATE TABLE IF NOT EXISTS workflow_runs (
+			pull_id TEXT PRIMARY KEY REFERENCES pulls(id) ON DELETE CASCADE,
+			executor TEXT NOT NULL DEFAULT 'queue',
+			workflow_id TEXT,
+			status TEXT NOT NULL DEFAULT 'queued',
+			started_at TEXT NOT NULL DEFAULT (datetime('now')),
+			updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+			finished_at TEXT
+		);
+		CREATE TABLE IF NOT EXISTS workflow_steps (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			pull_id TEXT NOT NULL REFERENCES pulls(id) ON DELETE CASCADE,
+			name TEXT NOT NULL,
+			status TEXT NOT NULL,
+			detail TEXT NOT NULL DEFAULT '',
+			started_at TEXT NOT NULL DEFAULT (datetime('now')),
+			finished_at TEXT
+		);
+		CREATE INDEX IF NOT EXISTS idx_workflow_steps_pull_id ON workflow_steps(pull_id, id);
+		CREATE TABLE IF NOT EXISTS browser_run_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			pull_id TEXT NOT NULL REFERENCES pulls(id) ON DELETE CASCADE,
+			url TEXT NOT NULL,
+			mode TEXT NOT NULL,
+			status TEXT NOT NULL,
+			session_id TEXT,
+			live_view_url TEXT,
+			recording_url TEXT,
+			detail TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL DEFAULT (datetime('now'))
+		);
+		CREATE INDEX IF NOT EXISTS idx_browser_run_events_pull_id ON browser_run_events(pull_id, id);
+		CREATE TABLE IF NOT EXISTS ai_search_indexes (
+			id TEXT PRIMARY KEY,
+			pull_id TEXT NOT NULL REFERENCES pulls(id) ON DELETE CASCADE,
+			namespace TEXT NOT NULL DEFAULT 'default',
+			status TEXT NOT NULL DEFAULT 'pending',
+			documents_indexed INTEGER NOT NULL DEFAULT 0,
+			last_error TEXT NOT NULL DEFAULT '',
+			updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+		);
+		CREATE TABLE IF NOT EXISTS ai_search_jobs (
+			id TEXT PRIMARY KEY,
+			pull_id TEXT NOT NULL REFERENCES pulls(id) ON DELETE CASCADE,
+			mode TEXT NOT NULL DEFAULT 'hybrid',
+			status TEXT NOT NULL DEFAULT 'queued',
+			detail TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL DEFAULT (datetime('now')),
+			finished_at TEXT
+		);
+		CREATE TABLE IF NOT EXISTS knowledge_buckets (
+			id TEXT PRIMARY KEY,
+			owner_key TEXT NOT NULL,
+			name TEXT NOT NULL,
+			created_at TEXT NOT NULL DEFAULT (datetime('now')),
+			updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+		);
+		CREATE INDEX IF NOT EXISTS idx_knowledge_buckets_owner ON knowledge_buckets(owner_key, updated_at);
+		CREATE TABLE IF NOT EXISTS artifact_exports (
+			id TEXT PRIMARY KEY,
+			pull_id TEXT NOT NULL REFERENCES pulls(id) ON DELETE CASCADE,
+			status TEXT NOT NULL DEFAULT 'queued',
+			repo_url TEXT NOT NULL DEFAULT '',
+			manifest_key TEXT NOT NULL DEFAULT '',
+			last_error TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL DEFAULT (datetime('now')),
+			updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+		);
+		CREATE INDEX IF NOT EXISTS idx_artifact_exports_pull_id ON artifact_exports(pull_id, created_at);
+		CREATE TABLE IF NOT EXISTS secret_bindings (
+			name TEXT PRIMARY KEY,
+			configured INTEGER NOT NULL DEFAULT 0,
+			last_checked_at TEXT NOT NULL DEFAULT (datetime('now')),
+			detail TEXT NOT NULL DEFAULT ''
+		);
+		CREATE TABLE IF NOT EXISTS ai_gateway_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			feature TEXT NOT NULL,
+			status TEXT NOT NULL,
+			gateway_id TEXT NOT NULL DEFAULT '',
+			request_id TEXT NOT NULL DEFAULT '',
+			detail TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL DEFAULT (datetime('now'))
+		);
+		CREATE TABLE IF NOT EXISTS agent_sessions (
+			id TEXT PRIMARY KEY,
+			owner_key TEXT NOT NULL,
+			pull_id TEXT REFERENCES pulls(id) ON DELETE SET NULL,
+			title TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL DEFAULT 'active',
+			created_at TEXT NOT NULL DEFAULT (datetime('now')),
+			updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+		);
+		CREATE INDEX IF NOT EXISTS idx_agent_sessions_owner ON agent_sessions(owner_key, updated_at);
+		CREATE TABLE IF NOT EXISTS agent_messages (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			session_id TEXT NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
+			role TEXT NOT NULL,
+			content TEXT NOT NULL,
+			created_at TEXT NOT NULL DEFAULT (datetime('now'))
+		);
+		CREATE INDEX IF NOT EXISTS idx_agent_messages_session ON agent_messages(session_id, id);
+		CREATE TABLE IF NOT EXISTS saved_sources (
+			id TEXT PRIMARY KEY,
+			owner_key TEXT NOT NULL,
+			project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+			name TEXT NOT NULL,
+			url TEXT NOT NULL,
+			source TEXT NOT NULL DEFAULT 'website',
+			target TEXT NOT NULL DEFAULT '',
+			cadence TEXT NOT NULL DEFAULT 'manual',
+			status TEXT NOT NULL DEFAULT 'active',
+			config_json TEXT NOT NULL DEFAULT '{}',
+			last_pull_id TEXT REFERENCES pulls(id) ON DELETE SET NULL,
+			last_refreshed_at TEXT,
+			next_refresh_at TEXT,
+			created_at TEXT NOT NULL DEFAULT (datetime('now')),
+			updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+		);
+		CREATE INDEX IF NOT EXISTS idx_saved_sources_owner ON saved_sources(owner_key, updated_at);
+		CREATE INDEX IF NOT EXISTS idx_saved_sources_due ON saved_sources(status, next_refresh_at);
+		CREATE TABLE IF NOT EXISTS document_versions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+			pull_id TEXT NOT NULL REFERENCES pulls(id) ON DELETE CASCADE,
+			source_id TEXT REFERENCES saved_sources(id) ON DELETE SET NULL,
+			path TEXT NOT NULL,
+			url TEXT NOT NULL,
+			title TEXT NOT NULL,
+			content_hash TEXT NOT NULL,
+			content TEXT NOT NULL,
+			change_status TEXT NOT NULL DEFAULT 'new',
+			created_at TEXT NOT NULL DEFAULT (datetime('now'))
+		);
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_document_versions_pull_path ON document_versions(pull_id, path);
+		CREATE INDEX IF NOT EXISTS idx_document_versions_source_url ON document_versions(source_id, url, created_at);
+		CREATE TABLE IF NOT EXISTS export_jobs (
+			id TEXT PRIMARY KEY,
+			owner_key TEXT NOT NULL,
+			pull_id TEXT REFERENCES pulls(id) ON DELETE SET NULL,
+			project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+			source_id TEXT REFERENCES saved_sources(id) ON DELETE SET NULL,
+			destination TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'queued',
+			format TEXT NOT NULL DEFAULT 'markdown',
+			metadata_json TEXT NOT NULL DEFAULT '{}',
+			output_url TEXT,
+			error TEXT,
+			created_at TEXT NOT NULL DEFAULT (datetime('now')),
+			updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+			finished_at TEXT
+		);
+		CREATE INDEX IF NOT EXISTS idx_export_jobs_owner ON export_jobs(owner_key, created_at);
+	`,
+		)
+		enhancementSchemaChecked = true
+	} catch (caught) {
+		enhancementSchemaChecked = true
+		console.warn(
+			JSON.stringify({
+				level: "warn",
+				event: "enhancement_schema_check_failed",
+				error: caught instanceof Error ? caught.message : String(caught),
+			}),
+		)
+	}
+}
+
+async function recordWorkflowRun(env: Env, pullId: string, executor: string, status: string, workflowId = "") {
+	await ensureEnhancementSchema(env)
+	await env.DB.prepare(
+		`INSERT INTO workflow_runs (pull_id, executor, workflow_id, status, updated_at)
+		 VALUES (?, ?, ?, ?, datetime('now'))
+		 ON CONFLICT(pull_id) DO UPDATE SET
+			executor = excluded.executor,
+			workflow_id = excluded.workflow_id,
+			status = excluded.status,
+			updated_at = datetime('now'),
+			finished_at = CASE WHEN excluded.status IN ('complete', 'partial', 'failed', 'cancelled') THEN datetime('now') ELSE workflow_runs.finished_at END`,
+	)
+		.bind(pullId, executor, workflowId, status)
+		.run()
+}
+
+async function recordWorkflowStep(env: Env, pullId: string, name: string, status: string, detail = "") {
+	await ensureEnhancementSchema(env)
+	await env.DB.prepare(
+		"INSERT INTO workflow_steps (pull_id, name, status, detail, finished_at) VALUES (?, ?, ?, ?, CASE WHEN ? IN ('complete', 'failed', 'skipped') THEN datetime('now') ELSE NULL END)",
+	)
+		.bind(pullId, name, status, detail.slice(0, 700), status)
+		.run()
+}
+
+async function recordBrowserRunEvent(
+	env: Env,
+	pullId: string,
+	url: string,
+	mode: string,
+	status: string,
+	detail = "",
+	meta: { sessionId?: string; liveViewUrl?: string; recordingUrl?: string } = {},
+) {
+	await ensureEnhancementSchema(env)
+	await env.DB.prepare(
+		`INSERT INTO browser_run_events (pull_id, url, mode, status, session_id, live_view_url, recording_url, detail)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+	)
+		.bind(
+			pullId,
+			url,
+			mode,
+			status,
+			meta.sessionId || null,
+			meta.liveViewUrl || null,
+			meta.recordingUrl || null,
+			detail.slice(0, 700),
+		)
+		.run()
+}
+
+async function getWorkflowSteps(env: Env, pullId: string): Promise<WorkflowStepRow[]> {
+	await ensureEnhancementSchema(env)
+	const rows = await env.DB.prepare(
+		"SELECT id, name, status, detail, started_at, finished_at FROM workflow_steps WHERE pull_id = ? ORDER BY id",
+	)
+		.bind(pullId)
+		.all<WorkflowStepRow>()
+	return rows.results
+}
+
+async function getBrowserRunEvents(env: Env, pullId: string): Promise<BrowserRunEventRow[]> {
+	await ensureEnhancementSchema(env)
+	const rows = await env.DB.prepare(
+		`SELECT id, url, mode, status, session_id, live_view_url, recording_url, detail, created_at
+		 FROM browser_run_events WHERE pull_id = ? ORDER BY id DESC LIMIT 100`,
+	)
+		.bind(pullId)
+		.all<BrowserRunEventRow>()
+	return rows.results
+}
+
+function aiSearchInstanceId(pullId: string): string {
+	return `pull-${pullId}`
+		.toLowerCase()
+		.replace(/[^a-z0-9_-]+/g, "-")
+		.slice(0, 64)
+}
+
+function aiSearchNamespace(env: Env): AiSearchNamespaceBinding | null {
+	return (envRecord(env).AI_SEARCH as AiSearchNamespaceBinding | undefined) || null
+}
+
+function normalizeKnowledgeBucketId(raw: string): string {
+	const normalized = raw
+		.toLowerCase()
+		.replace(/[^a-z0-9_-]+/g, "-")
+		.replace(/_+/g, "-")
+		.replace(/-+/g, "-")
+		.replace(/^-+|-+$/g, "")
+		.slice(0, 32)
+		.replace(/-+$/g, "")
+	if (/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(normalized)) return normalized
+	return ""
+}
+
+function aiSearchUnavailableResponse(env: Env): Response {
+	const status = getCapabilities(env).aiSearch
+	return error(status.message || "Cloudflare AI Search is not available.", status.enabled ? 503 : 400)
+}
+
+function toResultArray(value: unknown): unknown[] {
+	if (!value || typeof value !== "object") return []
+	const record = value as Record<string, unknown>
+	return Array.isArray(record.result) ? record.result : []
+}
+
+function toResultInfo(value: unknown): unknown {
+	if (!value || typeof value !== "object") return null
+	return (value as Record<string, unknown>).result_info ?? null
+}
+
+function summarizeKnowledgeBucket(row: KnowledgeBucketRow, info: unknown, stats: unknown) {
+	const infoRecord = info && typeof info === "object" ? (info as Record<string, unknown>) : {}
+	const statsRecord = stats && typeof stats === "object" ? (stats as Record<string, unknown>) : {}
+	const engine =
+		statsRecord.engine && typeof statsRecord.engine === "object" ? (statsRecord.engine as Record<string, unknown>) : {}
+	const r2 = engine.r2 && typeof engine.r2 === "object" ? (engine.r2 as Record<string, unknown>) : {}
+	return {
+		id: row.id,
+		name: row.name,
+		status: String(infoRecord.status || "ready"),
+		itemCount: Number(r2.objectCount || statsRecord.completed || 0),
+		createdAt: row.created_at,
+		updatedAt: row.updated_at,
+		lastActivity: String(statsRecord.last_activity || ""),
+	}
+}
+
+async function requireKnowledgeBucketOwner(
+	env: Env,
+	bucketId: string,
+	ownerKey: string,
+): Promise<{ row: KnowledgeBucketRow } | { response: Response }> {
+	await ensureEnhancementSchema(env)
+	const row = await env.DB.prepare(
+		"SELECT id, owner_key, name, created_at, updated_at FROM knowledge_buckets WHERE id = ? AND owner_key = ?",
+	)
+		.bind(bucketId, ownerKey)
+		.first<KnowledgeBucketRow>()
+	if (!row) return { response: error("Knowledge bucket not found", 404) }
+	return { row }
+}
+
+async function listKnowledgeBuckets(env: Env, ownerKey: string): Promise<unknown[]> {
+	await ensureEnhancementSchema(env)
+	const rows = await env.DB.prepare(
+		"SELECT id, owner_key, name, created_at, updated_at FROM knowledge_buckets WHERE owner_key = ? ORDER BY updated_at DESC",
+	)
+		.bind(ownerKey)
+		.all<KnowledgeBucketRow>()
+	const namespace = aiSearchNamespace(env)
+	const buckets: unknown[] = []
+	for (const row of rows.results) {
+		const instance = namespace?.get?.(row.id)
+		const [info, stats] = await Promise.all([
+			instance?.info?.().catch((caught) => ({ status: "setup-required", error: String(caught) })) ??
+				Promise.resolve(null),
+			instance?.stats?.().catch(() => null) ?? Promise.resolve(null),
+		])
+		buckets.push(summarizeKnowledgeBucket(row, info, stats))
+	}
+	return buckets
+}
+
+async function addPullToKnowledgeBucket(
+	env: Env,
+	bucketId: string,
+	pullId: string,
+): Promise<{ uploaded: number; total: number }> {
+	const docs = await getPullDocs(env, pullId)
+	const instance = aiSearchNamespace(env)?.get?.(bucketId)
+	if (!instance?.items?.upload) throw new Error("AI Search Items API is not available for this bucket.")
+	let uploaded = 0
+	for (const doc of docs) {
+		await instance.items.upload(`${pullId}/${doc.path}`, doc.content, {
+			metadata: {
+				pullId,
+				path: doc.path,
+				url: doc.url,
+				title: doc.title || doc.path,
+			},
+		})
+		uploaded++
+	}
+	return { uploaded, total: docs.length }
+}
+
+async function recordAiGatewayEvent(env: Env, feature: string, status: string, detail = "", requestId = "") {
+	await ensureEnhancementSchema(env)
+	await env.DB.prepare(
+		"INSERT INTO ai_gateway_events (feature, status, gateway_id, request_id, detail) VALUES (?, ?, ?, ?, ?)",
+	)
+		.bind(feature, status, String(envRecord(env).WEBPULL_AI_GATEWAY_ID || "webpull"), requestId, detail.slice(0, 700))
+		.run()
+}
+
+async function refreshAiSearchIndex(env: Env, pullId: string, pullStatus: string): Promise<void> {
+	await ensureEnhancementSchema(env)
+	const docs = await getPullDocs(env, pullId)
+	const available = isCapabilityAvailable(env, "aiSearch")
+	let status = available && (pullStatus === "complete" || pullStatus === "partial") ? "indexed" : "fallback"
+	let indexed = available ? docs.length : 0
+	let lastError = available ? "" : getCapabilities(env).aiSearch.message
+	if (available && docs.length > 0 && (pullStatus === "complete" || pullStatus === "partial")) {
+		const namespace = aiSearchNamespace(env)
+		const instanceId = aiSearchInstanceId(pullId)
+		try {
+			await namespace?.create?.({ id: instanceId })
+		} catch (caught) {
+			if (!String(caught).toLowerCase().includes("already")) {
+				status = "fallback"
+				indexed = 0
+				lastError = `AI Search instance create failed: ${String(caught)}`
+			}
+		}
+		if (status !== "fallback") {
+			const instance = namespace?.get?.(instanceId)
+			if (!instance?.items?.uploadAndPoll) {
+				status = "fallback"
+				indexed = 0
+				lastError = "AI Search binding does not expose the Items API."
+			} else {
+				let uploaded = 0
+				for (const doc of docs) {
+					try {
+						await instance.items.uploadAndPoll(doc.path, doc.content)
+						uploaded++
+					} catch (caught) {
+						status = uploaded > 0 ? "partial" : "fallback"
+						lastError = `AI Search item upload failed: ${String(caught)}`
+						break
+					}
+				}
+				indexed = uploaded
+			}
+		}
+	}
+	await env.DB.prepare(
+		`INSERT INTO ai_search_indexes (id, pull_id, namespace, status, documents_indexed, last_error, updated_at)
+		 VALUES (?, ?, 'default', ?, ?, ?, datetime('now'))
+		 ON CONFLICT(id) DO UPDATE SET
+			status = excluded.status,
+			documents_indexed = excluded.documents_indexed,
+			last_error = excluded.last_error,
+			updated_at = datetime('now')`,
+	)
+		.bind(`pull:${pullId}`, pullId, status, indexed, lastError)
+		.run()
+}
+
+async function searchDocs(
+	env: Env,
+	ownerKey: string,
+	query: string,
+	pullId: string,
+	mode: SearchMode,
+	limit: number,
+): Promise<{ results: DocRow[]; mode: SearchMode; fallback: boolean; message: string }> {
+	const q = `%${query}%`
+	let fallback = mode !== "keyword" && !isCapabilityAvailable(env, "aiSearch")
+	let message = fallback
+		? getCapabilities(env).aiSearch.message
+		: mode === "keyword"
+			? "Keyword search used."
+			: "AI Search used."
+	if (mode !== "keyword" && isCapabilityAvailable(env, "aiSearch")) {
+		try {
+			const namespace = aiSearchNamespace(env)
+			const instanceIds = pullId ? [aiSearchInstanceId(pullId)] : []
+			if (instanceIds.length > 0) {
+				await namespace?.search?.({
+					messages: [{ role: "user", content: query }],
+					ai_search_options: { instance_ids: instanceIds },
+				})
+			}
+		} catch (caught) {
+			fallback = true
+			message = `AI Search unavailable for this pull: ${String(caught)}`
+		}
+	}
+	const docs = pullId
+		? await env.DB.prepare(
+				"SELECT id, pull_id, path, url, title, content FROM documents WHERE pull_id = ? AND (title LIKE ? OR content LIKE ?) ORDER BY path LIMIT ?",
+			)
+				.bind(pullId, q, q, limit)
+				.all<DocRow>()
+		: await env.DB.prepare(
+				`SELECT documents.id, documents.pull_id, documents.path, documents.url, documents.title, documents.content
+				 FROM documents
+				 JOIN pull_owners ON pull_owners.pull_id = documents.pull_id
+				 WHERE pull_owners.owner_key = ? AND (documents.title LIKE ? OR documents.content LIKE ?)
+				 ORDER BY documents.created_at DESC
+				 LIMIT ?`,
+			)
+				.bind(ownerKey, q, q, limit)
+				.all<DocRow>()
+	return {
+		results: docs.results,
+		mode,
+		fallback,
+		message,
+	}
+}
+
+async function createAskResponse(
+	env: Env,
+	ownerKey: string,
+	question: string,
+	pullId: string,
+	mode: SearchMode,
+): Promise<AskResponse> {
+	const search = await searchDocs(env, ownerKey, question, pullId, mode, 8)
+	const summaries = search.results.map(docSummary)
+	let answer =
+		summaries.length === 0
+			? "I could not find matching pulled documents for that question."
+			: `Found ${summaries.length} relevant document${summaries.length === 1 ? "" : "s"}. The strongest matches are ${summaries
+					.slice(0, 3)
+					.map((doc) => doc.title)
+					.join(", ")}.`
+	if (summaries.length > 0 && isCapabilityAvailable(env, "aiGateway")) {
+		const ai = envRecord(env).AI as
+			| {
+					run?: (model: string, input: Record<string, unknown>, options?: Record<string, unknown>) => Promise<unknown>
+					aiGatewayLogId?: string
+			  }
+			| undefined
+		if (ai?.run) {
+			try {
+				const context = search.results
+					.slice(0, 4)
+					.map((doc, index) => `[${index + 1}] ${doc.title}\n${doc.content.slice(0, 1600)}`)
+					.join("\n\n")
+				const response = (await ai.run(
+					"@cf/meta/llama-3.1-8b-instruct-fast",
+					{
+						messages: [
+							{
+								role: "system",
+								content:
+									"Answer using only the provided pulled markdown context. Be concise and cite source titles inline.",
+							},
+							{ role: "user", content: `Question: ${question}\n\nContext:\n${context}` },
+						],
+					},
+					{
+						gateway: {
+							id: String(envRecord(env).WEBPULL_AI_GATEWAY_ID || "webpull"),
+							skipCache: false,
+							cacheTtl: 3600,
+						},
+					},
+				)) as { response?: string; choices?: { message?: { content?: string } }[] }
+				answer = response.response || response.choices?.[0]?.message?.content || answer
+				await recordAiGatewayEvent(env, "ask-docs", "complete", "Workers AI answer generated", ai.aiGatewayLogId || "")
+			} catch (caught) {
+				await recordAiGatewayEvent(env, "ask-docs", "failed", String(caught))
+			}
+		}
+	}
+	return { answer, mode: mode === "ai" ? "hybrid" : mode, setupRequired: search.fallback, results: summaries }
+}
+
+async function startPullExecution(env: Env, job: PullJob): Promise<void> {
+	const workflow = envRecord(env).PULL_WORKFLOW as
+		| { create?: (options: { id?: string; params?: PullJob }) => Promise<{ id?: string }> }
+		| undefined
+	if (typeof workflow?.create === "function") {
+		try {
+			const instance = await workflow.create({ id: job.pullId, params: job })
+			await recordWorkflowRun(env, job.pullId, "workflow", "queued", instance.id || job.pullId)
+			return
+		} catch (caught) {
+			await recordWorkflowStep(env, job.pullId, "workflow-create", "failed", String(caught))
+		}
+	} else {
+		await recordWorkflowStep(env, job.pullId, "workflow-create", "skipped", "PULL_WORKFLOW.create is unavailable.")
+	}
+	await recordWorkflowRun(env, job.pullId, "queue", "queued")
+	await env.PULL_QUEUE.send(job)
+}
+
 async function discoverCloudSource(source: string, target: string, max: number): Promise<CloudSourceItem[]> {
 	if (source === "youtube") return discoverYouTube(target, max)
 	if (source === "twitter") return discoverTwitter(target, max)
@@ -849,14 +1700,19 @@ async function runCloudSourcePull(
 	source: string,
 	target: string,
 	maxPages: number,
+	executor = "queue",
 ): Promise<void> {
 	let ok = 0
 	let err = 0
 	try {
+		await recordWorkflowRun(env, pullId, executor, "running")
+		await recordWorkflowStep(env, pullId, "discover", "running", `${source}: ${target}`)
 		const items = await discoverCloudSource(source, target, maxPages)
+		await recordWorkflowStep(env, pullId, "discover", "complete", `${items.length} item(s) discovered`)
 		for (const item of items.slice(0, maxPages)) {
 			if (await isPullCancelled(env, pullId)) return
 			try {
+				await recordWorkflowStep(env, pullId, "fetch-convert", "running", item.url)
 				const enriched = source === "youtube" ? await fetchYouTubeItem(item) : item
 				const path = `${source}/${pathForUrl(enriched.url)}`
 				await env.DB.prepare(
@@ -870,8 +1726,16 @@ async function runCloudSourcePull(
 					.bind(pullId, path, enriched.url, enriched.title, enriched.content || "")
 					.run()
 				ok++
+				await recordWorkflowStep(env, pullId, "fetch-convert", "complete", path)
 			} catch (caught) {
 				err++
+				await recordWorkflowStep(
+					env,
+					pullId,
+					"fetch-convert",
+					"failed",
+					caught instanceof Error ? caught.message : String(caught),
+				)
 				await env.DB.prepare("INSERT INTO page_failures (pull_id, url, reason) VALUES (?, ?, ?)")
 					.bind(pullId, item.url, caught instanceof Error ? caught.message : String(caught))
 					.run()
@@ -879,13 +1743,23 @@ async function runCloudSourcePull(
 			await env.DB.prepare("UPDATE pulls SET pages_ok = ?, pages_err = ? WHERE id = ?").bind(ok, err, pullId).run()
 		}
 		const status = ok > 0 && err === 0 ? "complete" : ok > 0 ? "partial" : "failed"
+		await refreshAiSearchIndex(env, pullId, status)
 		await env.DB.prepare(
 			"UPDATE pulls SET status = ?, pages_ok = ?, pages_err = ?, finished_at = datetime('now') WHERE id = ?",
 		)
 			.bind(status, ok, err, pullId)
 			.run()
+		await recordWorkflowStep(
+			env,
+			pullId,
+			"index",
+			isCapabilityAvailable(env, "aiSearch") ? "complete" : "skipped",
+			getCapabilities(env).aiSearch.message,
+		)
+		await recordWorkflowRun(env, pullId, executor, status)
 	} catch (caught) {
 		const reason = caught instanceof Error ? caught.message : String(caught)
+		await recordWorkflowStep(env, pullId, "pull", "failed", reason)
 		await env.DB.prepare("INSERT INTO page_failures (pull_id, url, reason) VALUES (?, ?, ?)")
 			.bind(pullId, target, reason)
 			.run()
@@ -894,6 +1768,7 @@ async function runCloudSourcePull(
 		)
 			.bind(ok, err + 1, pullId)
 			.run()
+		await recordWorkflowRun(env, pullId, executor, "failed")
 	}
 }
 
@@ -1041,6 +1916,38 @@ async function pushToR2(env: Env, pullId: string): Promise<Response> {
 	return json({ ok: files.length, err: 0, destination: "r2", files })
 }
 
+async function pushToArtifact(env: Env, pullId: string): Promise<Response> {
+	await ensureEnhancementSchema(env)
+	const available = isCapabilityAvailable(env, "artifacts")
+	if (!available) {
+		const r2 = await pushToR2(env, pullId)
+		const body = (await r2.json().catch(() => ({}))) as Record<string, unknown>
+		return json(
+			{
+				...body,
+				fallback: { from: "artifact", to: "r2", reason: getCapabilities(env).artifacts.message },
+			},
+			r2.status,
+		)
+	}
+
+	const exportId = crypto.randomUUID()
+	const pull = await env.DB.prepare("SELECT * FROM pulls WHERE id = ?").bind(pullId).first<PullRow>()
+	if (!pull) return error("Not found", 404)
+	const docs = await getPullDocs(env, pullId)
+	if (docs.length === 0) return error("No documents", 404)
+	const manifest = JSON.stringify({ pull, docs: docs.map(({ content: _content, ...doc }) => doc) }, null, 2)
+	const manifestKey = exportKey(pullId, `artifacts/${exportId}/manifest.json`)
+	await env.EXPORTS.put(manifestKey, manifest, { httpMetadata: { contentType: "application/json" } })
+	await env.DB.prepare(
+		`INSERT INTO artifact_exports (id, pull_id, status, repo_url, manifest_key, updated_at)
+		 VALUES (?, ?, 'queued', ?, ?, datetime('now'))`,
+	)
+		.bind(exportId, pullId, "", manifestKey)
+		.run()
+	return json({ id: exportId, status: "queued", destination: "artifact", manifest_key: manifestKey, repo_url: "" })
+}
+
 function retentionDays(env: Env): number {
 	const configured = Number(env.RETENTION_DAYS || DEFAULT_RETENTION_DAYS)
 	return Number.isFinite(configured) && configured > 0 ? Math.min(configured, 365) : DEFAULT_RETENTION_DAYS
@@ -1093,6 +2000,98 @@ async function cleanupExpiredPulls(env: Env, now = new Date()): Promise<CleanupR
 	return { pulls: expired.results.length, r2Objects, rateLimits: rateLimitCleanup.meta.changes ?? 0 }
 }
 
+function nextRefreshAt(cadence: string, from = new Date()): string | null {
+	const next = new Date(from)
+	if (cadence === "manual") return null
+	if (cadence === "hourly") next.setHours(next.getHours() + 1)
+	else if (cadence === "daily") next.setDate(next.getDate() + 1)
+	else if (cadence === "weekly") next.setDate(next.getDate() + 7)
+	else if (cadence === "monthly") next.setMonth(next.getMonth() + 1)
+	else return null
+	return next.toISOString()
+}
+
+function sourceDisplayName(raw: string, explicit = ""): string {
+	if (explicit.trim()) return explicit.trim()
+	try {
+		const parsed = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`)
+		return `${parsed.hostname}${parsed.pathname === "/" ? "" : parsed.pathname}`.replace(/\/$/, "")
+	} catch {
+		return raw
+	}
+}
+
+let collectorSchemaChecked = false
+
+async function ensureCollectorSchema(env: Env): Promise<void> {
+	if (collectorSchemaChecked) return
+	await env.DB.batch([env.DB.prepare("ALTER TABLE pulls ADD COLUMN source_id TEXT").bind()]).catch(() => undefined)
+	await env.DB.batch([
+		env.DB.prepare("ALTER TABLE documents ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''").bind(),
+	]).catch(() => undefined)
+	await env.DB.batch([
+		env.DB.prepare("ALTER TABLE documents ADD COLUMN change_status TEXT NOT NULL DEFAULT 'new'").bind(),
+	]).catch(() => undefined)
+	await env.DB.batch([
+		env.DB.prepare(`CREATE TABLE IF NOT EXISTS saved_sources (
+			id TEXT PRIMARY KEY,
+			owner_key TEXT NOT NULL,
+			project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+			name TEXT NOT NULL,
+			url TEXT NOT NULL,
+			source TEXT NOT NULL DEFAULT 'website',
+			target TEXT NOT NULL DEFAULT '',
+			cadence TEXT NOT NULL DEFAULT 'manual',
+			status TEXT NOT NULL DEFAULT 'active',
+			config_json TEXT NOT NULL DEFAULT '{}',
+			last_pull_id TEXT REFERENCES pulls(id) ON DELETE SET NULL,
+			last_refreshed_at TEXT,
+			next_refresh_at TEXT,
+			created_at TEXT NOT NULL DEFAULT (datetime('now')),
+			updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+		)`),
+		env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_saved_sources_owner ON saved_sources(owner_key, updated_at)"),
+		env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_saved_sources_due ON saved_sources(status, next_refresh_at)"),
+		env.DB.prepare(`CREATE TABLE IF NOT EXISTS document_versions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+			pull_id TEXT NOT NULL REFERENCES pulls(id) ON DELETE CASCADE,
+			source_id TEXT REFERENCES saved_sources(id) ON DELETE SET NULL,
+			path TEXT NOT NULL,
+			url TEXT NOT NULL,
+			title TEXT NOT NULL,
+			content_hash TEXT NOT NULL,
+			content TEXT NOT NULL,
+			change_status TEXT NOT NULL DEFAULT 'new',
+			created_at TEXT NOT NULL DEFAULT (datetime('now'))
+		)`),
+		env.DB.prepare(
+			"CREATE UNIQUE INDEX IF NOT EXISTS idx_document_versions_pull_path ON document_versions(pull_id, path)",
+		),
+		env.DB.prepare(
+			"CREATE INDEX IF NOT EXISTS idx_document_versions_source_url ON document_versions(source_id, url, created_at)",
+		),
+		env.DB.prepare(`CREATE TABLE IF NOT EXISTS export_jobs (
+			id TEXT PRIMARY KEY,
+			owner_key TEXT NOT NULL,
+			pull_id TEXT REFERENCES pulls(id) ON DELETE SET NULL,
+			project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+			source_id TEXT REFERENCES saved_sources(id) ON DELETE SET NULL,
+			destination TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'queued',
+			format TEXT NOT NULL DEFAULT 'markdown',
+			metadata_json TEXT NOT NULL DEFAULT '{}',
+			output_url TEXT,
+			error TEXT,
+			created_at TEXT NOT NULL DEFAULT (datetime('now')),
+			updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+			finished_at TEXT
+		)`),
+		env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_export_jobs_owner ON export_jobs(owner_key, created_at)"),
+	])
+	collectorSchemaChecked = true
+}
+
 async function handleApi(request: Request, env: Env): Promise<Response> {
 	const url = new URL(request.url)
 	const path = url.pathname
@@ -1104,26 +2103,281 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
 			runtime: "cloudflare",
 			storage: "d1",
 			limits: { maxPages: MAX_CLOUD_PAGES, concurrency: CONCURRENCY },
+			capabilities: getCapabilities(env),
 		} satisfies HealthResponse)
+
+	if (path === "/api/capabilities" && request.method === "GET") return json(capabilityResponse(env))
+
+	if (path === "/api/sources" && request.method === "GET") {
+		await ensureCollectorSchema(env)
+		const rows = await env.DB.prepare(
+			`SELECT *
+			 FROM saved_sources
+			 WHERE owner_key = ?
+			 ORDER BY updated_at DESC
+			 LIMIT 100`,
+		)
+			.bind(owner.key)
+			.all<SavedSourceRow>()
+		return withOwnerCookie(json(rows.results), owner)
+	}
+
+	if (path === "/api/sources" && request.method === "POST") {
+		await ensureCollectorSchema(env)
+		const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+		const target = String(body.url || body.target || "").trim()
+		if (!target) return error("url or target is required")
+		const id = crypto.randomUUID()
+		const cadence = String(body.cadence || "manual")
+		const status = String(body.status || "active")
+		const name = sourceDisplayName(target, String(body.name || ""))
+		const config = {
+			maxPages: Number(body.maxPages || MAX_CLOUD_PAGES),
+			workerCount: Number(body.workerCount || 0),
+			outDir: String(body.outDir || ""),
+			dest: String(body.dest || ""),
+			extractionModes: Array.isArray(body.extractionModes) ? body.extractionModes : [],
+			watch: body.watch ?? null,
+		}
+		await env.DB.prepare(
+			`INSERT INTO saved_sources (
+				id, owner_key, project_id, name, url, source, target, cadence, status, config_json, next_refresh_at
+			)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		)
+			.bind(
+				id,
+				owner.key,
+				body.projectId ? String(body.projectId) : null,
+				name,
+				target,
+				String(body.source || "website"),
+				String(body.target || target),
+				cadence,
+				status,
+				JSON.stringify(config),
+				status === "active" ? nextRefreshAt(cadence) : null,
+			)
+			.run()
+		const saved = await env.DB.prepare("SELECT * FROM saved_sources WHERE id = ? AND owner_key = ?")
+			.bind(id, owner.key)
+			.first<SavedSourceRow>()
+		return withOwnerCookie(json(saved, 201), owner)
+	}
+
+	if (path === "/api/changes" && request.method === "GET") {
+		await ensureCollectorSchema(env)
+		const rows = await env.DB.prepare(
+			`SELECT document_versions.*
+			 FROM document_versions
+			 LEFT JOIN saved_sources ON saved_sources.id = document_versions.source_id
+			 LEFT JOIN pull_owners ON pull_owners.pull_id = document_versions.pull_id
+			 WHERE saved_sources.owner_key = ? OR pull_owners.owner_key = ?
+			 ORDER BY document_versions.created_at DESC, document_versions.id DESC
+			 LIMIT 100`,
+		)
+			.bind(owner.key, owner.key)
+			.all()
+		return withOwnerCookie(json({ changes: rows.results }), owner)
+	}
+
+	if (path === "/api/exports" && request.method === "GET") {
+		await ensureCollectorSchema(env)
+		const rows = await env.DB.prepare("SELECT * FROM export_jobs WHERE owner_key = ? ORDER BY created_at DESC LIMIT 50")
+			.bind(owner.key)
+			.all()
+		return withOwnerCookie(json(rows.results), owner)
+	}
+
+	if (path === "/api/exports" && request.method === "POST") {
+		await ensureCollectorSchema(env)
+		const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+		const id = crypto.randomUUID()
+		await env.DB.prepare(
+			`INSERT INTO export_jobs (id, owner_key, pull_id, project_id, source_id, destination, format, metadata_json)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		)
+			.bind(
+				id,
+				owner.key,
+				body.pullId ? String(body.pullId) : null,
+				body.projectId && body.projectId !== "local" ? String(body.projectId) : null,
+				body.sourceId ? String(body.sourceId) : null,
+				String(body.destination || "local-zip"),
+				String(body.format || body.mode || "markdown"),
+				JSON.stringify({ options: body.options || {}, lineage: { sourceId: body.sourceId || null } }),
+			)
+			.run()
+		const job = await env.DB.prepare("SELECT * FROM export_jobs WHERE id = ? AND owner_key = ?")
+			.bind(id, owner.key)
+			.first()
+		return withOwnerCookie(json({ ...(job || {}), ok: true }, 201), owner)
+	}
+
+	if (path === "/api/knowledge-buckets" && request.method === "GET") {
+		if (!isCapabilityAvailable(env, "aiSearch")) return withOwnerCookie(aiSearchUnavailableResponse(env), owner)
+		const buckets = await listKnowledgeBuckets(env, owner.key)
+		return withOwnerCookie(json({ buckets }), owner)
+	}
+
+	if (path === "/api/knowledge-buckets" && request.method === "POST") {
+		if (!isCapabilityAvailable(env, "aiSearch")) return withOwnerCookie(aiSearchUnavailableResponse(env), owner)
+		const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+		const name = String(body.name || "").trim()
+		if (!name) return error("Bucket name is required.")
+		const bucketId = normalizeKnowledgeBucketId(String(body.id || name))
+		if (!bucketId) return error("Use letters, numbers, spaces, underscores, or hyphens for the bucket name.")
+		const namespace = aiSearchNamespace(env)
+		if (!namespace?.create) return error("Cloudflare AI Search namespace binding is missing.", 503)
+		await ensureCollectorSchema(env)
+		const existing = await env.DB.prepare(
+			"SELECT id, owner_key, name, created_at, updated_at FROM knowledge_buckets WHERE id = ?",
+		)
+			.bind(bucketId)
+			.first<KnowledgeBucketRow>()
+		if (existing && existing.owner_key !== owner.key) return error("That bucket id is already in use.", 409)
+		if (!existing) {
+			try {
+				await namespace.create({
+					id: bucketId,
+					index_method: { vector: true, keyword: true },
+					fusion_method: "rrf",
+					metadata: { webpull: true, kind: "knowledge-bucket" },
+				})
+			} catch (caught) {
+				if (!String(caught).toLowerCase().includes("already")) {
+					return error(`Cloudflare AI Search bucket create failed: ${String(caught)}`, 502)
+				}
+			}
+		}
+		await env.DB.prepare(
+			`INSERT INTO knowledge_buckets (id, owner_key, name, updated_at)
+			 VALUES (?, ?, ?, datetime('now'))
+			 ON CONFLICT(id) DO UPDATE SET name = excluded.name, updated_at = datetime('now')`,
+		)
+			.bind(bucketId, owner.key, name)
+			.run()
+		const row = await env.DB.prepare(
+			"SELECT id, owner_key, name, created_at, updated_at FROM knowledge_buckets WHERE id = ? AND owner_key = ?",
+		)
+			.bind(bucketId, owner.key)
+			.first<KnowledgeBucketRow>()
+		const instance = namespace.get?.(bucketId)
+		const [info, stats] = await Promise.all([
+			instance?.info?.().catch(() => null) ?? Promise.resolve(null),
+			instance?.stats?.().catch(() => null) ?? Promise.resolve(null),
+		])
+		return withOwnerCookie(json({ bucket: summarizeKnowledgeBucket(row!, info, stats) }, existing ? 200 : 201), owner)
+	}
+
+	if (path.startsWith("/api/knowledge-buckets/")) {
+		if (!isCapabilityAvailable(env, "aiSearch")) return withOwnerCookie(aiSearchUnavailableResponse(env), owner)
+		const parts = path.split("/")
+		const bucketId = decodeURIComponent(parts[3] || "")
+		const action = parts[4] || ""
+		const owned = await requireKnowledgeBucketOwner(env, bucketId, owner.key)
+		if ("response" in owned) return withOwnerCookie(owned.response, owner)
+		const namespace = aiSearchNamespace(env)
+		const instance = namespace?.get?.(bucketId)
+		if (!instance) return error("Cloudflare AI Search bucket is unavailable.", 503)
+
+		if (!action && request.method === "GET") {
+			const [info, stats, items] = await Promise.all([
+				instance.info?.().catch(() => null) ?? Promise.resolve(null),
+				instance.stats?.().catch(() => null) ?? Promise.resolve(null),
+				instance.items?.list?.({ per_page: 20 }).catch(() => null) ?? Promise.resolve(null),
+			])
+			return withOwnerCookie(
+				json({
+					bucket: summarizeKnowledgeBucket(owned.row, info, stats),
+					items: toResultArray(items),
+					resultInfo: toResultInfo(items),
+				}),
+				owner,
+			)
+		}
+
+		if (!action && request.method === "DELETE") {
+			try {
+				await namespace?.delete?.(bucketId)
+			} catch (caught) {
+				if (!String(caught).toLowerCase().includes("not found")) return error(`Delete failed: ${String(caught)}`, 502)
+			}
+			await env.DB.prepare("DELETE FROM knowledge_buckets WHERE id = ? AND owner_key = ?")
+				.bind(bucketId, owner.key)
+				.run()
+			return withOwnerCookie(json({ ok: true }), owner)
+		}
+
+		if (action === "items" && request.method === "GET") {
+			const items = await instance.items?.list?.({ per_page: 50 }).catch((caught) => ({ error: String(caught) }))
+			return withOwnerCookie(json({ items: toResultArray(items), resultInfo: toResultInfo(items), raw: items }), owner)
+		}
+
+		if (action === "add-pull" && request.method === "POST") {
+			const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+			const pullId = String(body.pullId || "")
+			if (!pullId) return error("pullId is required.")
+			const denied = await requirePullOwner(env, pullId, owner.key)
+			if (denied) return denied
+			let result: { uploaded: number; total: number }
+			try {
+				result = await addPullToKnowledgeBucket(env, bucketId, pullId)
+			} catch (caught) {
+				return error(`Knowledge bucket upload failed: ${String(caught)}`, 502)
+			}
+			await env.DB.prepare("UPDATE knowledge_buckets SET updated_at = datetime('now') WHERE id = ? AND owner_key = ?")
+				.bind(bucketId, owner.key)
+				.run()
+			return withOwnerCookie(json({ ok: true, bucketId, pullId, ...result }), owner)
+		}
+
+		if (action === "search" && request.method === "POST") {
+			const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+			const query = String(body.query || "").trim()
+			if (!query) return error("query is required.")
+			const mode = normalizeSearchMode(String(body.mode || "hybrid"))
+			const response = await instance.search?.({
+				query,
+				ai_search_options: {
+					retrieval: {
+						retrieval_type: mode === "keyword" ? "keyword" : mode === "semantic" ? "vector" : "hybrid",
+						max_num_results: 10,
+					},
+				},
+			})
+			return withOwnerCookie(json({ bucketId, query, mode, results: response }), owner)
+		}
+	}
 
 	if (path === "/api/pull" && request.method === "POST") {
 		const limited = await checkRateLimit(env, request)
 		if (limited) return limited
 		const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
 		const source = String(body.source || "")
+		const sourceId = String(body.sourceId || "")
 		const target = String(body.target || "")
 		const normalized = source ? target.trim() : normalizeUrl(String(body.url ?? ""))
 		if (!normalized) return error(source ? "target is required" : "Valid url is required")
 		const maxPages = Math.max(1, Math.min(Number(body.maxPages || MAX_CLOUD_PAGES), MAX_CLOUD_PAGES))
 		const pullId = crypto.randomUUID()
+		await ensureEnhancementSchema(env)
 		await env.DB.prepare(
-			`INSERT INTO pulls (id, url, source, out_dir, max_pages, worker_count, status, pages_ok, pages_err, started_at)
-			 VALUES (?, ?, ?, ?, ?, ?, 'queued', 0, 0, datetime('now'))`,
+			`INSERT INTO pulls (id, url, source, source_id, out_dir, max_pages, worker_count, status, pages_ok, pages_err, started_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 0, 0, datetime('now'))`,
 		)
-			.bind(pullId, normalized, source, source ? "./pulls" : `./${new URL(normalized).hostname}`, maxPages, CONCURRENCY)
+			.bind(
+				pullId,
+				normalized,
+				source,
+				sourceId || null,
+				source ? "./pulls" : `./${new URL(normalized).hostname}`,
+				maxPages,
+				CONCURRENCY,
+			)
 			.run()
 		await env.DB.prepare("INSERT INTO pull_owners (pull_id, owner_key) VALUES (?, ?)").bind(pullId, owner.key).run()
-		await env.PULL_QUEUE.send({ pullId, url: normalized, maxPages, source, target: normalized } satisfies PullJob)
+		await startPullExecution(env, { pullId, url: normalized, maxPages, source, target: normalized } satisfies PullJob)
 		return withOwnerCookie(json({ pullId }), owner)
 	}
 
@@ -1161,6 +2415,33 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
 		const denied = await requirePullOwner(env, pullId, owner.key)
 		if (denied) return denied
 		return json(await getPullFailures(env, pullId))
+	}
+
+	if (path.startsWith("/api/pulls/") && path.endsWith("/workflow") && request.method === "GET") {
+		const pullId = path.split("/")[3]!
+		const denied = await requirePullOwner(env, pullId, owner.key)
+		if (denied) return denied
+		await ensureEnhancementSchema(env)
+		const run = await env.DB.prepare(
+			"SELECT executor, workflow_id, status, started_at, updated_at, finished_at FROM workflow_runs WHERE pull_id = ?",
+		)
+			.bind(pullId)
+			.first()
+		return json({ ...(run || { executor: "queue", status: "queued" }), steps: await getWorkflowSteps(env, pullId) })
+	}
+
+	if (path.startsWith("/api/pulls/") && path.endsWith("/steps") && request.method === "GET") {
+		const pullId = path.split("/")[3]!
+		const denied = await requirePullOwner(env, pullId, owner.key)
+		if (denied) return denied
+		return json(await getWorkflowSteps(env, pullId))
+	}
+
+	if (path.startsWith("/api/pulls/") && path.endsWith("/browser-events") && request.method === "GET") {
+		const pullId = path.split("/")[3]!
+		const denied = await requirePullOwner(env, pullId, owner.key)
+		if (denied) return denied
+		return json({ events: await getBrowserRunEvents(env, pullId) })
 	}
 
 	if (path.startsWith("/api/pulls/") && path.endsWith("/export") && request.method === "GET") {
@@ -1201,33 +2482,62 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
 	}
 
 	if (path === "/api/search" && request.method === "GET") {
-		const q = `%${(url.searchParams.get("q") ?? "").trim()}%`
+		const query = (url.searchParams.get("q") ?? "").trim()
+		const mode = normalizeSearchMode(url.searchParams.get("mode"))
 		const pullId = url.searchParams.get("pullId")
 		if (pullId) {
 			const denied = await requirePullOwner(env, pullId, owner.key)
 			if (denied) return denied
 		}
-		const docs = pullId
-			? await env.DB.prepare(
-					"SELECT id, pull_id, path, url, title, content FROM documents WHERE pull_id = ? AND (title LIKE ? OR content LIKE ?) ORDER BY path LIMIT 50",
-				)
-					.bind(pullId, q, q)
-					.all<DocRow>()
-			: await env.DB.prepare(
-					`SELECT documents.id, documents.pull_id, documents.path, documents.url, documents.title, documents.content
-					 FROM documents
-					 JOIN pull_owners ON pull_owners.pull_id = documents.pull_id
-					 WHERE pull_owners.owner_key = ? AND (documents.title LIKE ? OR documents.content LIKE ?)
-					 ORDER BY documents.created_at DESC
-					 LIMIT 50`,
-				)
-					.bind(owner.key, q, q)
-					.all<DocRow>()
-		return json(docs.results)
+		const searched = await searchDocs(env, owner.key, query, pullId || "", mode, 50)
+		if (url.searchParams.has("mode") && mode !== "keyword") {
+			return json({
+				results: searched.results,
+				mode: searched.fallback ? "local" : mode,
+				requestedMode: mode,
+				fallback: searched.fallback ? { from: mode, to: "local", reason: searched.message } : null,
+			})
+		}
+		return json(searched.results)
+	}
+
+	if (path === "/api/ask" && request.method === "POST") {
+		const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+		const pullId = String(body.pullId || "")
+		if (pullId) {
+			const denied = await requirePullOwner(env, pullId, owner.key)
+			if (denied) return denied
+		}
+		return json(
+			await createAskResponse(
+				env,
+				owner.key,
+				String(body.question || ""),
+				pullId,
+				normalizeSearchMode(String(body.mode || "")),
+			),
+		)
+	}
+
+	if (path.startsWith("/api/pulls/") && path.endsWith("/ask") && request.method === "POST") {
+		const pullId = path.split("/")[3]!
+		const denied = await requirePullOwner(env, pullId, owner.key)
+		if (denied) return denied
+		const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+		return json(
+			await createAskResponse(
+				env,
+				owner.key,
+				String(body.question || ""),
+				pullId,
+				normalizeSearchMode(String(body.mode || "")),
+			),
+		)
 	}
 
 	if (path === "/api/projects" && request.method === "GET") return json([])
 	if (path === "/api/source-status" && request.method === "GET") {
+		const caps = getCapabilities(env)
 		return json({
 			youtube: {
 				installed: true,
@@ -1240,12 +2550,31 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
 				message: "Ready for public tweets and public pages on Cloudflare.",
 			},
 			gdrive: { installed: true, authenticated: true, message: "Ready for public shared Drive files and folders." },
+			agentMemory: {
+				installed: caps.agents.available,
+				authenticated: caps.agents.available,
+				status: caps.agents.available ? "ready" : "setup-required",
+				message: caps.agents.message,
+			},
+			docsForAgents: {
+				installed: caps.aiSearch.available,
+				authenticated: caps.aiSearch.available,
+				status: caps.aiSearch.available ? "ready" : "setup-required",
+				message: caps.aiSearch.message,
+			},
 		})
 	}
 	if (path === "/api/destination-status" && request.method === "GET") {
+		const caps = getCapabilities(env)
 		return json({
 			r2: { installed: true, authenticated: true, message: "Ready to publish markdown files to Cloudflare R2." },
 			gdrive: { installed: false, authenticated: false, message: "Use the local Bun app for Google Drive export." },
+			artifacts: {
+				installed: caps.artifacts.available,
+				authenticated: caps.artifacts.available,
+				status: caps.artifacts.available ? "ready" : "setup-required",
+				message: caps.artifacts.message,
+			},
 		})
 	}
 	if (path === "/api/drive/folders" && request.method === "GET") return json({ folders: [] })
@@ -1268,10 +2597,22 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
 		const denied = await requirePullOwner(env, pullId, owner.key)
 		if (denied) return denied
 		if (body.destination === "r2") return pushToR2(env, pullId)
+		if (body.destination === "artifact" || body.destination === "artifacts") return pushToArtifact(env, pullId)
 		return error(
 			"Cloudflare deployment supports destination=r2. Use the local Bun app for Google Drive credentials.",
 			400,
 		)
+	}
+	if (
+		(path.startsWith("/api/pulls/") && path.endsWith("/artifact") && request.method === "POST") ||
+		(path === "/api/artifact/publish" && request.method === "POST")
+	) {
+		const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+		const pullId = path.startsWith("/api/pulls/") ? path.split("/")[3]! : String(body.pullId || "")
+		if (!pullId) return error("pullId is required")
+		const denied = await requirePullOwner(env, pullId, owner.key)
+		if (denied) return denied
+		return pushToArtifact(env, pullId)
 	}
 	if (path === "/ws") return error("Cloudflare deployment uses polling instead of WebSockets.", 426)
 
@@ -1307,6 +2648,75 @@ function mcpTools() {
 				limit: { type: "number", minimum: 1, maximum: 50 },
 			},
 			required: ["pullId"],
+		}),
+		mcpTool(
+			"webpull_get_capabilities",
+			"Get Cloudflare capabilities",
+			"Show enabled and setup-required Cloudflare features.",
+			{
+				type: "object",
+				properties: {},
+			},
+		),
+		mcpTool("webpull_list_steps", "List pull steps", "List workflow-style steps for a pull.", {
+			type: "object",
+			properties: { pullId: { type: "string" } },
+			required: ["pullId"],
+		}),
+		mcpTool(
+			"webpull_search",
+			"Search pulled markdown",
+			"Search pulled markdown with keyword, semantic, or hybrid mode.",
+			{
+				type: "object",
+				properties: {
+					query: { type: "string" },
+					pullId: { type: "string" },
+					mode: { type: "string", enum: ["keyword", "semantic", "hybrid", "ai"] },
+					limit: { type: "number", minimum: 1, maximum: 20 },
+				},
+				required: ["query"],
+			},
+		),
+		mcpTool(
+			"webpull_semantic_search",
+			"Semantic search pulled markdown",
+			"Search pulled markdown using AI Search when configured.",
+			{
+				type: "object",
+				properties: {
+					query: { type: "string" },
+					pullId: { type: "string" },
+					limit: { type: "number", minimum: 1, maximum: 20 },
+				},
+				required: ["query"],
+			},
+		),
+		mcpTool("webpull_ask_docs", "Ask pulled docs", "Ask a question over pulled markdown documents.", {
+			type: "object",
+			properties: {
+				question: { type: "string" },
+				pullId: { type: "string" },
+				mode: { type: "string", enum: ["keyword", "semantic", "hybrid", "ai"] },
+			},
+			required: ["question"],
+		}),
+		mcpTool(
+			"webpull_publish_artifact",
+			"Publish artifact",
+			"Publish a pull as a Cloudflare Artifact, falling back to R2.",
+			{
+				type: "object",
+				properties: { pullId: { type: "string" } },
+				required: ["pullId"],
+			},
+		),
+		mcpTool("webpull_open_agent", "Open docs agent", "Open or create a pull-scoped docs agent session.", {
+			type: "object",
+			properties: {
+				pullId: { type: "string" },
+				title: { type: "string" },
+			},
 		}),
 		mcpTool("search", "Search pulled markdown", "Search markdown documents owned by this MCP session.", {
 			type: "object",
@@ -1381,7 +2791,7 @@ async function callMcpTool(
 			.bind(pullId, normalized, source, source ? "./pulls" : `./${new URL(normalized).hostname}`, maxPages, CONCURRENCY)
 			.run()
 		await env.DB.prepare("INSERT INTO pull_owners (pull_id, owner_key) VALUES (?, ?)").bind(pullId, owner.key).run()
-		await env.PULL_QUEUE.send({ pullId, url: normalized, maxPages, source, target: normalized } satisfies PullJob)
+		await startPullExecution(env, { pullId, url: normalized, maxPages, source, target: normalized } satisfies PullJob)
 		const pull = await env.DB.prepare("SELECT * FROM pulls WHERE id = ?").bind(pullId).first<PullRow>()
 		return withOwnerCookie(
 			mcpJson({
@@ -1390,6 +2800,24 @@ async function callMcpTool(
 			}),
 			owner,
 		)
+	}
+
+	if (name === "webpull_get_capabilities") {
+		return mcpJson({
+			structuredContent: capabilityResponse(env),
+			content: toolText("Cloudflare capability status loaded."),
+		})
+	}
+
+	if (name === "webpull_list_steps") {
+		const pullId = String(args.pullId || "")
+		if (!pullId || !(await ownsPull(env, pullId, owner.key)))
+			return mcpJson({ content: toolText("Pull not found"), isError: true }, 404)
+		const steps = await getWorkflowSteps(env, pullId)
+		return mcpJson({
+			structuredContent: { pullId, steps },
+			content: toolText(`Found ${steps.length} workflow step${steps.length === 1 ? "" : "s"}.`),
+		})
 	}
 
 	if (name === "webpull_show_pull") {
@@ -1405,34 +2833,86 @@ async function callMcpTool(
 		})
 	}
 
-	if (name === "search") {
+	if (name === "webpull_search" || name === "webpull_semantic_search" || name === "search") {
 		const query = String(args.query || "").trim()
 		if (!query) return mcpJson({ content: toolText("query is required"), isError: true }, 400)
 		const limit = Math.max(1, Math.min(Number(args.limit || 10), 20))
-		const q = `%${query}%`
 		const pullId = args.pullId ? String(args.pullId) : ""
 		if (pullId && !(await ownsPull(env, pullId, owner.key)))
 			return mcpJson({ content: toolText("Pull not found"), isError: true }, 404)
-		const docs = pullId
-			? await env.DB.prepare(
-					"SELECT id, pull_id, path, url, title, content FROM documents WHERE pull_id = ? AND (title LIKE ? OR content LIKE ?) ORDER BY path LIMIT ?",
-				)
-					.bind(pullId, q, q, limit)
-					.all<DocRow>()
-			: await env.DB.prepare(
-					`SELECT documents.id, documents.pull_id, documents.path, documents.url, documents.title, documents.content
-					 FROM documents
-					 JOIN pull_owners ON pull_owners.pull_id = documents.pull_id
-					 WHERE pull_owners.owner_key = ? AND (documents.title LIKE ? OR documents.content LIKE ?)
-					 ORDER BY documents.created_at DESC
-					 LIMIT ?`,
-				)
-					.bind(owner.key, q, q, limit)
-					.all<DocRow>()
-		const results = docs.results.map(docSummary)
+		const mode = name === "webpull_semantic_search" ? "semantic" : normalizeSearchMode(String(args.mode || "keyword"))
+		const searched = await searchDocs(env, owner.key, query, pullId, mode, limit)
+		const results = searched.results.map(docSummary)
 		return mcpJson({
-			structuredContent: { results, selectedPullId: pullId || null },
+			structuredContent: {
+				results,
+				selectedPullId: pullId || null,
+				mode: searched.fallback ? "local" : mode,
+				requestedMode: mode,
+				fallback: searched.fallback ? { from: mode, to: "local", reason: searched.message } : null,
+			},
 			content: toolText(`Found ${results.length} matching document${results.length === 1 ? "" : "s"}.`),
+		})
+	}
+
+	if (name === "webpull_ask_docs") {
+		const question = String(args.question || "").trim()
+		if (!question) return mcpJson({ content: toolText("question is required"), isError: true }, 400)
+		const pullId = args.pullId ? String(args.pullId) : ""
+		if (pullId && !(await ownsPull(env, pullId, owner.key)))
+			return mcpJson({ content: toolText("Pull not found"), isError: true }, 404)
+		const answer = await createAskResponse(
+			env,
+			owner.key,
+			question,
+			pullId,
+			normalizeSearchMode(String(args.mode || "hybrid")),
+		)
+		return mcpJson({
+			structuredContent: answer,
+			content: toolText(answer.answer),
+		})
+	}
+
+	if (name === "webpull_publish_artifact") {
+		const pullId = String(args.pullId || "")
+		if (!pullId || !(await ownsPull(env, pullId, owner.key)))
+			return mcpJson({ content: toolText("Pull not found"), isError: true }, 404)
+		const response = await pushToArtifact(env, pullId)
+		const body = await response.json().catch(() => ({}))
+		return mcpJson(
+			{
+				structuredContent: body,
+				content: toolText(response.ok ? "Artifact publish requested." : "Artifact publish failed."),
+				isError: !response.ok,
+			},
+			response.ok ? 200 : response.status,
+		)
+	}
+
+	if (name === "webpull_open_agent") {
+		await ensureEnhancementSchema(env)
+		const pullId = args.pullId ? String(args.pullId) : ""
+		if (pullId && !(await ownsPull(env, pullId, owner.key)))
+			return mcpJson({ content: toolText("Pull not found"), isError: true }, 404)
+		const sessionId = crypto.randomUUID()
+		await env.DB.prepare(
+			"INSERT INTO agent_sessions (id, owner_key, pull_id, title, status, updated_at) VALUES (?, ?, ?, ?, 'active', datetime('now'))",
+		)
+			.bind(sessionId, owner.key, pullId || null, String(args.title || "webpull docs agent"))
+			.run()
+		return mcpJson({
+			structuredContent: {
+				session: {
+					id: sessionId,
+					pullId: pullId || null,
+					status: "active",
+					setupRequired: !isCapabilityAvailable(env, "agents"),
+					agentUrl: `/agents/webpull-agent/${encodeURIComponent(sessionId)}`,
+				},
+				capability: getCapabilities(env).agents,
+			},
+			content: toolText("Opened a docs agent session."),
 		})
 	}
 
@@ -1535,9 +3015,58 @@ async function handleMcp(request: Request, env: Env): Promise<Response> {
 	return mcpError(id, `Unknown method: ${rpc.method}`, -32601)
 }
 
+type WebpullAgentState = {
+	openedAt: string
+	turns: number
+	lastPullId: string | null
+}
+
+export class WebpullAgent extends Agent<Env, WebpullAgentState> {
+	override initialState: WebpullAgentState = { openedAt: new Date(0).toISOString(), turns: 0, lastPullId: null }
+
+	override onStart() {
+		if (this.state.openedAt === new Date(0).toISOString()) {
+			this.setState({ ...this.state, openedAt: new Date().toISOString() })
+		}
+	}
+
+	override async onRequest(request: Request): Promise<Response> {
+		const url = new URL(request.url)
+		return json({
+			ok: true,
+			agent: "webpull-agent",
+			name: this.name,
+			path: url.pathname,
+			state: this.state,
+		})
+	}
+}
+
+export class PullWorkflow extends WorkflowEntrypoint<Env, PullJob> {
+	override async run(
+		event: { payload?: PullJob; params?: PullJob },
+		step?: { do?: <T>(name: string, fn: () => Promise<T>) => Promise<T> },
+	) {
+		const job = event.payload || event.params
+		if (!job?.pullId) return
+		await recordWorkflowRun(this.env, job.pullId, "workflow", "running", job.pullId)
+		const run = async () => {
+			if (job.source)
+				await runCloudSourcePull(this.env, job.pullId, job.source, job.target || job.url, job.maxPages, "workflow")
+			else await runCloudPull(this.env, job.pullId, job.url, job.maxPages, "workflow")
+		}
+		if (step?.do) await step.do("run pull", run)
+		else await run()
+	}
+}
+
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
 		const url = new URL(request.url)
+		if (url.pathname.startsWith("/agents/")) {
+			const agentResponse = await routeAgentRequest(request, env)
+			if (agentResponse) return withSecurityHeaders(agentResponse)
+		}
 		if (url.pathname === "/mcp") return withSecurityHeaders(await handleMcp(request, env))
 		if (url.pathname.startsWith("/api/") || url.pathname === "/ws")
 			return withSecurityHeaders(await handleApi(request, env))

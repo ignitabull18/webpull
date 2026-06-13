@@ -39,6 +39,28 @@ interface SearchResult {
 	pull_url: string
 }
 
+type SearchMode = "keyword" | "semantic" | "hybrid"
+
+interface AskResponse {
+	answer?: string
+	citations?: { title?: string; path?: string; url?: string }[]
+	error?: string
+}
+
+interface ArtifactResponse {
+	id?: string
+	status?: string
+	repo_url?: string
+	manifest_key?: string
+	error?: string
+}
+
+interface KnowledgeBucket {
+	id: string
+	name: string
+	itemCount?: number
+}
+
 interface TreeNode {
 	name: string
 	path: string
@@ -94,14 +116,28 @@ export default function Results() {
 	const [pushError, setPushError] = useState("")
 	const [pushOk, setPushOk] = useState(false)
 	const [pushFiles, setPushFiles] = useState<{ path: string; url: string }[]>([])
+	const [searchMode, setSearchMode] = useState<SearchMode>("hybrid")
+	const [askQuestion, setAskQuestion] = useState("")
+	const [asking, setAsking] = useState(false)
+	const [askResponse, setAskResponse] = useState<AskResponse | null>(null)
+	const [askError, setAskError] = useState("")
+	const [publishingArtifact, setPublishingArtifact] = useState(false)
+	const [artifactResult, setArtifactResult] = useState<ArtifactResponse | null>(null)
+	const [artifactError, setArtifactError] = useState("")
+	const [knowledgeBuckets, setKnowledgeBuckets] = useState<KnowledgeBucket[]>([])
+	const [knowledgeBucketId, setKnowledgeBucketId] = useState("")
+	const [knowledgeBusy, setKnowledgeBusy] = useState(false)
+	const [knowledgeMessage, setKnowledgeMessage] = useState("")
+	const [knowledgeError, setKnowledgeError] = useState("")
 
 	useEffect(() => {
 		async function load() {
 			try {
-				const [pullRes, docsRes, failuresRes] = await Promise.all([
+				const [pullRes, docsRes, failuresRes, bucketsRes] = await Promise.all([
 					fetch(`/api/pulls/${pullId}`),
 					fetch(`/api/pulls/${pullId}/docs`),
 					fetch(`/api/pulls/${pullId}/failures`),
+					fetch("/api/knowledge-buckets"),
 				])
 				if (pullRes.ok) setPull((await pullRes.json()) as PullInfo)
 				if (docsRes.ok) {
@@ -110,6 +146,12 @@ export default function Results() {
 					if (docsData.length > 0) setSelectedDoc(docsData[0]!)
 				}
 				if (failuresRes.ok) setFailures((await failuresRes.json()) as PageFailure[])
+				if (bucketsRes.ok) {
+					const bucketData = (await bucketsRes.json()) as { buckets?: KnowledgeBucket[] }
+					const buckets = bucketData.buckets || []
+					setKnowledgeBuckets(buckets)
+					setKnowledgeBucketId((current) => current || buckets[0]?.id || "")
+				}
 			} catch {
 			} finally {
 				setLoading(false)
@@ -124,10 +166,15 @@ export default function Results() {
 			return
 		}
 		try {
-			const res = await fetch(`/api/search?q=${encodeURIComponent(searchQuery)}&pullId=${pullId}`)
+			const params = new URLSearchParams({
+				q: searchQuery,
+				mode: searchMode,
+				pullId: pullId || "",
+			})
+			const res = await fetch(`/api/search?${params.toString()}`)
 			if (res.ok) setSearchResults((await res.json()) as SearchResult[])
 		} catch {}
-	}, [searchQuery, pullId])
+	}, [searchQuery, pullId, searchMode])
 
 	useEffect(() => {
 		const timer = setTimeout(handleSearch, 300)
@@ -195,6 +242,91 @@ export default function Results() {
 		}
 	}
 
+	const handleAsk = async () => {
+		if (!askQuestion.trim()) return
+		setAsking(true)
+		setAskError("")
+		setAskResponse(null)
+		try {
+			const body = JSON.stringify({ pullId, question: askQuestion, mode: searchMode })
+			for (const endpoint of [`/api/pulls/${pullId}/ask`, "/api/ask"]) {
+				const res = await fetch(endpoint, {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body,
+				})
+				const data = (await res.json().catch(() => ({}))) as AskResponse
+				if (res.ok) {
+					setAskResponse(data)
+					return
+				}
+				if (res.status !== 404 && res.status !== 405) {
+					setAskError(data.error || "Ask is not available for this pull yet.")
+					return
+				}
+			}
+			setAskError("Ask is not available for this pull yet.")
+		} catch (e) {
+			setAskError(String(e))
+		} finally {
+			setAsking(false)
+		}
+	}
+
+	const handlePublishArtifact = async () => {
+		setPublishingArtifact(true)
+		setArtifactError("")
+		setArtifactResult(null)
+		try {
+			const body = JSON.stringify({ pullId })
+			for (const endpoint of [`/api/pulls/${pullId}/artifact`, "/api/artifact/publish"]) {
+				const res = await fetch(endpoint, {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body,
+				})
+				const data = (await res.json().catch(() => ({}))) as ArtifactResponse
+				if (res.ok) {
+					setArtifactResult(data)
+					return
+				}
+				if (res.status !== 404 && res.status !== 405) {
+					setArtifactError(data.error || "Artifact publishing is not available yet.")
+					return
+				}
+			}
+			setArtifactError("Artifact publishing is not available yet.")
+		} catch (e) {
+			setArtifactError(String(e))
+		} finally {
+			setPublishingArtifact(false)
+		}
+	}
+
+	const handleAddToKnowledge = async () => {
+		if (!knowledgeBucketId) return
+		setKnowledgeBusy(true)
+		setKnowledgeError("")
+		setKnowledgeMessage("")
+		try {
+			const res = await fetch(`/api/knowledge-buckets/${encodeURIComponent(knowledgeBucketId)}/add-pull`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ pullId }),
+			})
+			const data = (await res.json().catch(() => ({}))) as { uploaded?: number; total?: number; error?: string }
+			if (!res.ok) {
+				setKnowledgeError(data.error || "Knowledge bucket update failed.")
+				return
+			}
+			setKnowledgeMessage(`Added ${data.uploaded || 0} of ${data.total || 0} documents.`)
+		} catch (caught) {
+			setKnowledgeError(String(caught))
+		} finally {
+			setKnowledgeBusy(false)
+		}
+	}
+
 	const hostname = pull?.url
 		? (() => {
 				try {
@@ -231,14 +363,93 @@ export default function Results() {
 							{pushing ? <span className="spinner" /> : pushOk ? "✓ Published" : "Publish to R2"}
 						</button>
 					)}
+					{(pull?.status === "complete" || pull?.status === "partial") && (
+						<button
+							type="button"
+							className="btn btn-ghost btn-small"
+							onClick={handlePublishArtifact}
+							disabled={publishingArtifact || artifactResult?.status === "complete"}
+							title="Publish a Cloudflare artifact export"
+						>
+							{publishingArtifact ? (
+								<span className="spinner" />
+							) : artifactResult ? (
+								"Artifact queued"
+							) : (
+								"Publish Artifact"
+							)}
+						</button>
+					)}
 				</div>
 				<div className="results-sidebar-header">
+					{(pull?.status === "complete" || pull?.status === "partial") && (
+						<div className="result-knowledge-box">
+							<div className="result-knowledge-title">Knowledge Bucket</div>
+							<div className="compact-control-row">
+								<select
+									value={knowledgeBucketId}
+									onChange={(e) => setKnowledgeBucketId((e.target as HTMLSelectElement).value)}
+								>
+									<option value="">Select bucket</option>
+									{knowledgeBuckets.map((bucket) => (
+										<option key={bucket.id} value={bucket.id}>
+											{bucket.name}
+										</option>
+									))}
+								</select>
+								<button
+									type="button"
+									className="btn btn-secondary btn-small"
+									onClick={handleAddToKnowledge}
+									disabled={knowledgeBusy || !knowledgeBucketId}
+								>
+									{knowledgeBusy ? <span className="spinner" /> : "Add"}
+								</button>
+							</div>
+							{knowledgeMessage && <div className="success-msg result-inline-msg">{knowledgeMessage}</div>}
+							{knowledgeError && <div className="error-msg result-inline-msg">{knowledgeError}</div>}
+							{knowledgeBuckets.length === 0 && (
+								<button type="button" className="btn btn-ghost btn-small" onClick={() => navigate("/knowledge")}>
+									Create bucket
+								</button>
+							)}
+						</div>
+					)}
+					<div className="compact-control-row">
+						<label htmlFor="result-search-mode">Mode</label>
+						<select
+							id="result-search-mode"
+							value={searchMode}
+							onChange={(e) => setSearchMode((e.target as HTMLSelectElement).value as SearchMode)}
+						>
+							<option value="hybrid">Hybrid</option>
+							<option value="semantic">Semantic</option>
+							<option value="keyword">Keyword</option>
+						</select>
+					</div>
 					<input
 						type="text"
 						placeholder="Filter docs…"
 						value={searchQuery}
 						onChange={(e) => setSearchQuery((e.target as HTMLInputElement).value)}
 					/>
+					<div className="ask-control">
+						<input
+							type="text"
+							placeholder="Ask this pull…"
+							value={askQuestion}
+							onChange={(e) => setAskQuestion((e.target as HTMLInputElement).value)}
+							onKeyDown={(e) => e.key === "Enter" && handleAsk()}
+						/>
+						<button
+							type="button"
+							className="btn btn-ghost btn-small"
+							onClick={handleAsk}
+							disabled={asking || !askQuestion.trim()}
+						>
+							{asking ? <span className="spinner" /> : "Ask"}
+						</button>
+					</div>
 				</div>
 				<div className="results-tree">
 					{searchResults ? (
@@ -273,6 +484,22 @@ export default function Results() {
 					)}
 				</div>
 				<div className="results-sidebar-footer">
+					{artifactError && (
+						<div className="error-msg" style={{ marginBottom: "6px", fontSize: "11px" }}>
+							{artifactError}
+						</div>
+					)}
+					{artifactResult && (
+						<div className="success-msg" style={{ marginBottom: "6px", fontSize: "11px" }}>
+							Artifact {artifactResult.status || "queued"}
+							{artifactResult.repo_url && (
+								<a href={artifactResult.repo_url} target="_blank" rel="noreferrer">
+									{" "}
+									Open
+								</a>
+							)}
+						</div>
+					)}
 					{pushError && (
 						<div className="error-msg" style={{ marginBottom: "6px", fontSize: "11px" }}>
 							{pushError}
@@ -305,6 +532,30 @@ export default function Results() {
 								<span className="fm-label">url:</span> <span className="fm-value">{selectedDoc.url}</span>
 							</div>
 						</div>
+						{(askResponse || askError) && (
+							<div className="ask-answer-block">
+								<div className="ask-answer-header">
+									<span>Ask</span>
+									<span>{searchMode}</span>
+								</div>
+								{askError ? (
+									<div className="error-msg">{askError}</div>
+								) : (
+									<>
+										<p>{askResponse?.answer || "No answer returned."}</p>
+										{askResponse?.citations && askResponse.citations.length > 0 && (
+											<div className="ask-citations">
+												{askResponse.citations.slice(0, 4).map((citation) => (
+													<span key={citation.path ?? citation.url ?? citation.title} className="ask-citation-badge">
+														{citation.title || citation.path || citation.url}
+													</span>
+												))}
+											</div>
+										)}
+									</>
+								)}
+							</div>
+						)}
 						<div className="markdown-body">
 							<ReactMarkdown
 								remarkPlugins={[remarkGfm]}

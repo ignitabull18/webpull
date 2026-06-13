@@ -2,6 +2,8 @@ import { chromium } from "playwright"
 
 const baseUrl = process.env.WEBPULL_CLOUDFLARE_URL || "https://webpull.lingering-rain-68b6.workers.dev"
 const targetUrl = process.env.WEBPULL_TEST_URL || "https://ignitabull.com"
+const targetHost = new URL(targetUrl).hostname
+const targetPattern = new RegExp(targetHost.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i")
 
 function check(name: string, ok: boolean, detail = "") {
 	if (!ok) {
@@ -36,7 +38,8 @@ page.on("console", (msg) => {
 page.on("pageerror", (err) => noisyErrors.push(err.message))
 
 try {
-	const documentResponse = await page.goto(baseUrl, { waitUntil: "networkidle", timeout: 45_000 })
+	const documentResponse = await page.goto(baseUrl, { waitUntil: "domcontentloaded", timeout: 45_000 })
+	await page.locator("body").waitFor({ timeout: 20_000 })
 	check(
 		"HTML has security headers",
 		documentResponse?.headers()["x-content-type-options"] === "nosniff" &&
@@ -163,15 +166,15 @@ try {
 		const readbackText = await readback.text()
 		check(
 			"R2 readback succeeds",
-			readback.ok() && /Ignitabull|Amazon Ads|extraction: "browser-run"/i.test(readbackText),
+			readback.ok() && /---\ntitle:/i.test(readbackText) && targetPattern.test(readbackText),
 			`status=${readback.status()}`,
 		)
 	}
 
-	await page.goto(`${baseUrl}/results/${pullId}`, { waitUntil: "networkidle", timeout: 45_000 })
+	await page.goto(`${baseUrl}/results/${pullId}`, { waitUntil: "domcontentloaded", timeout: 45_000 })
 	await page.waitForTimeout(1500)
 	const resultsText = await page.locator("body").innerText()
-	check("results render", /Ignitabull|ignitabull\.com|audit\.md/i.test(resultsText))
+	check("results render", targetPattern.test(resultsText) || /index\.md|audit\.md/i.test(resultsText))
 	check("browser console is quiet", noisyErrors.length === 0, noisyErrors.join(" | "))
 } finally {
 	await browser.close()

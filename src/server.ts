@@ -4,21 +4,38 @@ import { dirname, isAbsolute, relative, resolve } from "node:path"
 import { Effect } from "effect"
 import { handleMcpRequest } from "./chatgpt-app"
 import {
+	addAskCitation,
+	createAskSession,
+	createExportJob,
 	createProject,
 	createPull,
+	createSavedSource,
+	createStructuredExtract,
 	deleteProject,
 	deletePull,
+	deleteSavedSource,
 	getDoc,
 	getDocById,
 	getProject,
 	getProjectDocCount,
 	getPull,
+	getPullChangeSummary,
+	getSavedSource,
 	insertDocuments,
 	listDocs,
 	listDocsByProject,
+	listDocumentChanges,
+	listDocumentDiagnostics,
+	listDueSavedSources,
+	listExportJobs,
 	listProjects,
 	listPulls,
 	listPullsByProject,
+	listSavedSources,
+	listStructuredExtracts,
+	markSavedSourceRefreshed,
+	recordDocumentDiagnostics,
+	recordRemovedDocumentsForPull,
 	type SearchResult,
 	searchDocs,
 	searchDocsInProject,
@@ -26,8 +43,18 @@ import {
 	setPullProject,
 	updateProject,
 	updatePull,
+	updateSavedSource,
 } from "./db"
 import { type PullEvent, runPull } from "./pull"
+import {
+	gdriveAdapter,
+	type SourceAdapter,
+	type SourceConfig,
+	type SourceItem,
+	twitterAdapter,
+	youtubeAdapter,
+} from "./sources"
+import { write } from "./write"
 
 const PORT = parseInt(process.env.WEBPULL_PORT || "3456", 10)
 const UI_DIR = resolve(import.meta.dir, "..", "ui")
@@ -39,32 +66,47 @@ try {
 	mkdirSync(PULLS_DIR, { recursive: true })
 } catch {}
 
-// --- opencli helpers ---
+// --- CLI auth helpers ---
 
-function getDoctorResult(): { installed: boolean; connected: boolean } {
+function getOpenCliConnected(): boolean {
 	try {
-		const out = execSync("opencli doctor", { encoding: "utf8", timeout: 8000 })
-		return {
-			installed: true,
-			connected: out.includes("[OK] Extension"),
-		}
-	} catch {
-		return { installed: false, connected: false }
-	}
-}
-
-function getYtDlpInstalled(): boolean {
-	try {
-		execSync("yt-dlp --version", { encoding: "utf8", timeout: 5000 })
-		return true
+		const out = execSync("opencli doctor", { encoding: "utf8", timeout: 1500 })
+		return out.includes("[OK] Extension")
 	} catch {
 		return false
 	}
 }
 
+function getYtDlpStatus(): { installed: boolean; authenticated: boolean; message: string } {
+	try {
+		const version = execSync("yt-dlp --version", { encoding: "utf8", timeout: 1500 }).trim()
+		return { installed: true, authenticated: true, message: `Ready with yt-dlp ${version}` }
+	} catch {
+		const connected = getOpenCliConnected()
+		return {
+			installed: connected,
+			authenticated: connected,
+			message: connected
+				? "Ready with OpenCLI Chrome session"
+				: "Install yt-dlp or connect the OpenCLI Chrome extension.",
+		}
+	}
+}
+
+function getTwitterStatus(): { installed: boolean; authenticated: boolean; message: string } {
+	const connected = getOpenCliConnected()
+	return {
+		installed: connected,
+		authenticated: connected,
+		message: connected
+			? "Ready with OpenCLI Chrome session"
+			: "Connect the OpenCLI Chrome extension for X/Twitter sources.",
+	}
+}
+
 function getGwsAuthStatus(): { installed: boolean; authenticated: boolean } {
 	try {
-		const out = execSync("opencli gws auth status", { encoding: "utf8", timeout: 8000 })
+		const out = execSync("opencli gws auth status", { encoding: "utf8", timeout: 1500 })
 		if (out.includes("Authenticated")) return { installed: true, authenticated: true }
 		return { installed: true, authenticated: false }
 	} catch {
@@ -96,6 +138,11 @@ buildUI()
 	.catch((err) => console.error("UI build error:", err))
 
 const activePulls = new Map<string, AbortController>()
+const SOURCE_ADAPTERS: Record<string, SourceAdapter> = {
+	youtube: youtubeAdapter,
+	twitter: twitterAdapter,
+	gdrive: gdriveAdapter,
+}
 
 const docBuffers = new Map<string, { pullId: string; path: string; url: string; title: string; content: string }[]>()
 const FLUSH_THRESHOLD = 50
@@ -131,7 +178,10 @@ function handlePullEvent(pullId: string, event: PullEvent) {
 		addDoc(pullId, { path: event.file, url: event.url, title: event.title ?? "", content: event.content ?? "" })
 	} else if (event.type === "complete") {
 		flushDocs(pullId)
+		recordRemovedDocumentsForPull(pullId)
 		updatePull(pullId, { status: "complete", pagesOk: event.ok, pagesErr: event.err })
+		const pull = getPull(pullId)
+		if (pull?.source_id) markSavedSourceRefreshed(pull.source_id, pullId)
 		activePulls.delete(pullId)
 		docBuffers.delete(pullId)
 	} else if (event.type === "error") {
@@ -178,6 +228,203 @@ function generateId(): string {
 	return crypto.randomUUID()
 }
 
+function sanitizeFilename(title: string): string {
+	return (
+		title
+			.replace(/[<>:"/\\|?*]/g, "-")
+			.replace(/\s+/g, "-")
+			.replace(/-+/g, "-")
+			.replace(/^-|-$/g, "")
+			.slice(0, 80) || "untitled"
+	)
+}
+
+function startSavedSourceRefresh(sourceId: string, server: Bun.Server<unknown>) {
+	const saved = getSavedSource(sourceId)
+	if (!saved) return { response: error("Saved source not found", 404), pullId: null }
+	const config = JSON.parse(saved.config_json || "{}") as {
+		outDir?: string
+		maxPages?: number
+		workerCount?: number
+		dest?: string
+	}
+	const target = saved.target || saved.url
+	const isSourcePull = !!(saved.source && saved.source !== "website")
+	const normalizedUrl = isSourcePull || /^https?:\/\//i.test(target) ? target : `https://${target}`
+	const max = Number(config.maxPages || 500)
+	const workers = Number(config.workerCount || 0)
+	const out = config.outDir || `./pulls/${sanitizeFilename(saved.name)}`
+	const pullId = generateId()
+	createPull({
+		id: pullId,
+		url: normalizedUrl,
+		source: isSourcePull ? saved.source : "",
+		sourceId: saved.id,
+		dest: config.dest || "",
+		outDir: resolve(out),
+		maxPages: max,
+		workerCount: workers,
+		projectId: saved.project_id || undefined,
+	})
+	const controller = new AbortController()
+	activePulls.set(pullId, controller)
+	const effect =
+		isSourcePull && SOURCE_ADAPTERS[saved.source]
+			? runSourcePullForServer(
+					pullId,
+					SOURCE_ADAPTERS[saved.source]!,
+					{ target: normalizedUrl, max, outDir: resolve(out) },
+					server,
+					controller,
+				)
+			: runPull(
+					{
+						url: normalizedUrl,
+						out: resolve(out),
+						max,
+						workerCount: workers || undefined,
+						pullId,
+						signal: controller.signal,
+					},
+					(event: PullEvent) => {
+						server.publish("pull-events", JSON.stringify({ pullId, event }))
+						handlePullEvent(pullId, event)
+					},
+				)
+	Effect.runPromise(effect).catch((err) => {
+		if (controller.signal.aborted) return
+		const errEvent: PullEvent = { type: "error", message: String(err) }
+		server.publish("pull-events", JSON.stringify({ pullId, event: errEvent }))
+		handlePullEvent(pullId, errEvent)
+	})
+	return { response: json({ pullId, source: saved }), pullId }
+}
+
+function localCapabilities() {
+	const flags = {
+		workflows: false,
+		aiSearch: false,
+		browserRecording: false,
+		artifacts: false,
+		secrets: false,
+		aiGateway: false,
+		agents: false,
+	}
+	const setupRequired = (message: string) => ({
+		enabled: false,
+		configured: false,
+		available: false,
+		setupRequired: false,
+		message,
+	})
+	return {
+		runtime: "bun",
+		featureFlags: { provider: "fallback", enabled: false, flags },
+		capabilities: {
+			workflows: setupRequired("Cloudflare Workflows are available only in the Cloudflare Worker deployment."),
+			aiSearch: setupRequired("Semantic search falls back to local SQLite full-text search here."),
+			browserRecording: setupRequired("Browser Run recordings are available only in the Cloudflare Worker deployment."),
+			artifacts: setupRequired("Artifacts publishing falls back to local export here."),
+			secrets: setupRequired("Secrets Store is available only in the Cloudflare Worker deployment."),
+			aiGateway: setupRequired("AI Gateway is available only in the Cloudflare Worker deployment."),
+			agents: setupRequired("Agents SDK is available only in the Cloudflare Worker deployment."),
+		},
+		bindings: {
+			workflows: { configured: false, available: false, status: "setup-required", message: "Cloudflare-only." },
+			aiSearch: {
+				configured: false,
+				available: false,
+				status: "setup-required",
+				message: "Using local search fallback.",
+			},
+			browserRecording: { configured: false, available: false, status: "setup-required", message: "Cloudflare-only." },
+			artifacts: {
+				configured: false,
+				available: false,
+				status: "setup-required",
+				message: "Using local export fallback.",
+			},
+			secretsStore: { configured: false, available: false, status: "setup-required", message: "Cloudflare-only." },
+			aiGateway: { configured: false, available: false, status: "setup-required", message: "Cloudflare-only." },
+			agents: { configured: false, available: false, status: "setup-required", message: "Cloudflare-only." },
+		},
+	}
+}
+
+function runSourcePullForServer(
+	pullId: string,
+	adapter: SourceAdapter,
+	config: SourceConfig,
+	server: Bun.Server<unknown>,
+	controller: AbortController,
+): Effect.Effect<void, Error> {
+	return Effect.gen(function* () {
+		const started = performance.now()
+		const items = yield* adapter.discover(config)
+		server.publish(
+			"pull-events",
+			JSON.stringify({ pullId, event: { type: "discover", urls: items.map((item) => item.url) } }),
+		)
+		server.publish(
+			"pull-events",
+			JSON.stringify({
+				pullId,
+				event: { type: "start", total: items.length, workerCount: 1, source: adapter.name.toLowerCase() },
+			}),
+		)
+		let ok = 0
+		let err = 0
+		for (let index = 0; index < items.length; index++) {
+			if (controller.signal.aborted) break
+			const item = items[index]!
+			try {
+				const result = yield* adapter.fetch(item)
+				const path = `${sanitizeFilename(item.title)}.md`
+				const markdown = result.content
+				yield* write({ url: item.url, title: item.title, markdown }, config.outDir)
+				addDoc(pullId, { path, url: item.url, title: item.title, content: markdown })
+				ok++
+				server.publish(
+					"pull-events",
+					JSON.stringify({
+						pullId,
+						event: {
+							type: "progress",
+							ok,
+							err,
+							status: "ok",
+							file: path,
+							url: item.url,
+							title: item.title,
+							content: markdown,
+							source: adapter.name.toLowerCase(),
+						},
+					}),
+				)
+			} catch {
+				err++
+				server.publish(
+					"pull-events",
+					JSON.stringify({
+						pullId,
+						event: { type: "progress", ok, err, status: "err", source: adapter.name.toLowerCase() },
+					}),
+				)
+			}
+		}
+		flushDocs(pullId)
+		const event = {
+			type: "complete",
+			ok,
+			err,
+			elapsed: (performance.now() - started) / 1000,
+			source: adapter.name.toLowerCase(),
+		}
+		server.publish("pull-events", JSON.stringify({ pullId, event }))
+		handlePullEvent(pullId, event as PullEvent)
+	})
+}
+
 const server = Bun.serve({
 	port: PORT,
 	async fetch(req, server) {
@@ -190,10 +437,152 @@ const server = Bun.serve({
 
 		// --- API routes ---
 
+		if (path === "/api/capabilities" && req.method === "GET") {
+			return json(localCapabilities())
+		}
+
+		if (path === "/api/knowledge-buckets" && req.method === "GET") {
+			return json({
+				buckets: [],
+				setupRequired: true,
+				message: "Cloudflare AI Search knowledge buckets are available in the Cloudflare deployment.",
+			})
+		}
+
+		if (path === "/api/sources" && req.method === "GET") {
+			const projectId = url.searchParams.get("projectId") || undefined
+			const dueOnly = url.searchParams.get("due") === "1"
+			return json(dueOnly ? listDueSavedSources() : listSavedSources(projectId))
+		}
+
+		if (path === "/api/sources" && req.method === "POST") {
+			try {
+				const body: any = await req.json()
+				const targetUrl = String(body.url || body.target || "").trim()
+				if (!targetUrl) return error("url or target is required")
+				const name =
+					String(body.name || "").trim() ||
+					(() => {
+						try {
+							const parsed = new URL(/^https?:\/\//i.test(targetUrl) ? targetUrl : `https://${targetUrl}`)
+							return `${parsed.hostname}${parsed.pathname === "/" ? "" : parsed.pathname}`.replace(/\/$/, "")
+						} catch {
+							return targetUrl
+						}
+					})()
+				const saved = createSavedSource({
+					name,
+					url: targetUrl,
+					target: body.target || targetUrl,
+					source: body.source || "website",
+					projectId: body.projectId || null,
+					cadence: body.cadence || "manual",
+					status: body.status || "active",
+					config: {
+						maxPages: Number(body.maxPages || 500),
+						workerCount: Number(body.workerCount || 0),
+						outDir: body.outDir || "",
+						dest: body.dest || "",
+						extractionModes: Array.isArray(body.extractionModes) ? body.extractionModes : [],
+						watch: body.watch || null,
+					},
+				})
+				return json(saved)
+			} catch (e) {
+				return error(String(e), 500)
+			}
+		}
+
+		if (path.startsWith("/api/sources/") && path.endsWith("/refresh") && req.method === "POST") {
+			const id = path.split("/")[3]!
+			return startSavedSourceRefresh(id, server).response
+		}
+
+		if (path.startsWith("/api/sources/") && req.method === "GET") {
+			const id = path.split("/")[3]!
+			const saved = getSavedSource(id)
+			if (!saved) return error("Not found", 404)
+			const pulls = listPulls().filter((pull) => pull.source_id === id)
+			return json({ ...saved, pulls })
+		}
+
+		if (path.startsWith("/api/sources/") && req.method === "PUT") {
+			try {
+				const id = path.split("/")[3]!
+				const body: any = await req.json()
+				updateSavedSource(id, {
+					name: body.name,
+					url: body.url,
+					target: body.target,
+					source: body.source,
+					projectId: body.projectId,
+					cadence: body.cadence,
+					status: body.status,
+					config: body.config,
+					nextRefreshAt: body.nextRefreshAt,
+				})
+				return json({ ok: true, source: getSavedSource(id) })
+			} catch (e) {
+				return error(String(e), 500)
+			}
+		}
+
+		if (path.startsWith("/api/sources/") && req.method === "DELETE") {
+			const id = path.split("/")[3]!
+			deleteSavedSource(id)
+			return json({ ok: true })
+		}
+
+		if (path === "/api/changes" && req.method === "GET") {
+			const pullId = url.searchParams.get("pullId")
+			const sourceId = url.searchParams.get("sourceId")
+			if (pullId) return json({ summary: getPullChangeSummary(pullId), changes: listDocumentChanges(pullId) })
+			const pulls = listPulls(100).filter((pull) => !sourceId || pull.source_id === sourceId)
+			const changes = pulls.flatMap((pull) => listDocumentChanges(pull.id))
+			return json({ changes })
+		}
+
+		if (path === "/api/exports" && req.method === "GET") {
+			const pullId = url.searchParams.get("pullId") || undefined
+			const projectId = url.searchParams.get("projectId") || undefined
+			const sourceId = url.searchParams.get("sourceId") || undefined
+			return json(listExportJobs({ pullId, projectId, sourceId }))
+		}
+
+		if (path === "/api/exports" && req.method === "POST") {
+			const body: any = await req.json().catch(() => ({}))
+			const job = createExportJob({
+				pullId: body.pullId || null,
+				projectId: body.projectId === "local" ? null : body.projectId || null,
+				sourceId: body.sourceId || null,
+				destination: body.destination || "local-zip",
+				format: body.format || body.mode || "markdown",
+				metadata: {
+					lineage: {
+						projectId: body.projectId || null,
+						sourceId: body.sourceId || null,
+						bucket: body.bucket || "",
+						extractionMethod: body.extractionMethod || body.mode || "defuddle",
+						lastRefresh: null,
+					},
+					options: body.options || {},
+				},
+			})
+			return json({ ...job, ok: true })
+		}
+
+		if (path === "/api/knowledge-buckets" && req.method === "POST") {
+			return error("Cloudflare AI Search knowledge buckets are available in the Cloudflare deployment.", 400)
+		}
+
+		if (path.startsWith("/api/knowledge-buckets/")) {
+			return error("Cloudflare AI Search knowledge buckets are available in the Cloudflare deployment.", 400)
+		}
+
 		if (path === "/api/pull" && req.method === "POST") {
 			try {
 				const body: any = await req.json()
-				const { url: targetUrl, source, target, dest, outDir, maxPages, workerCount, projectId } = body
+				const { url: targetUrl, source, sourceId, target, dest, outDir, maxPages, workerCount, projectId } = body
 				const isSourcePull = !!(source && target)
 				const pullUrl = isSourcePull ? target : targetUrl
 				if (!pullUrl || typeof pullUrl !== "string") return error("url or target is required")
@@ -219,25 +608,34 @@ const server = Bun.serve({
 					maxPages: max,
 					workerCount: workers,
 					projectId: projectId || undefined,
+					sourceId: sourceId || undefined,
 				})
 				const controller = new AbortController()
 				activePulls.set(pullId, controller)
-				Effect.runPromise(
-					runPull(
-						{
-							url: normalizedUrl,
-							out: resolve(out),
-							max,
-							workerCount: workers || undefined,
-							pullId,
-							signal: controller.signal,
-						},
-						(event: PullEvent) => {
-							server.publish("pull-events", JSON.stringify({ pullId, event }))
-							handlePullEvent(pullId, event)
-						},
-					),
-				).catch((err) => {
+				const effect =
+					isSourcePull && SOURCE_ADAPTERS[source]
+						? runSourcePullForServer(
+								pullId,
+								SOURCE_ADAPTERS[source]!,
+								{ target: normalizedUrl, max, outDir: resolve(out) },
+								server,
+								controller,
+							)
+						: runPull(
+								{
+									url: normalizedUrl,
+									out: resolve(out),
+									max,
+									workerCount: workers || undefined,
+									pullId,
+									signal: controller.signal,
+								},
+								(event: PullEvent) => {
+									server.publish("pull-events", JSON.stringify({ pullId, event }))
+									handlePullEvent(pullId, event)
+								},
+							)
+				Effect.runPromise(effect).catch((err) => {
 					if (controller.signal.aborted) return
 					const errEvent: PullEvent = { type: "error", message: String(err) }
 					server.publish("pull-events", JSON.stringify({ pullId, event: errEvent }))
@@ -266,14 +664,21 @@ const server = Bun.serve({
 		if (
 			path.startsWith("/api/pulls/") &&
 			!path.includes("/docs") &&
+			!path.includes("/changes") &&
 			!path.endsWith("/export") &&
+			!path.endsWith("/exports") &&
 			!path.endsWith("/project") &&
 			req.method === "GET"
 		) {
 			const id = path.split("/")[3]!
 			const pull = getPull(id)
 			if (!pull) return error("Not found", 404)
-			return json(pull)
+			return json({ ...pull, changes: getPullChangeSummary(id), exports: listExportJobs({ pullId: id }) })
+		}
+
+		if (path.startsWith("/api/pulls/") && path.endsWith("/changes") && req.method === "GET") {
+			const id = path.split("/")[3]!
+			return json({ summary: getPullChangeSummary(id), changes: listDocumentChanges(id) })
 		}
 
 		if (path.startsWith("/api/pulls/") && path.endsWith("/docs") && req.method === "GET") {
@@ -292,6 +697,36 @@ const server = Bun.serve({
 			return json(listPulls())
 		}
 
+		if (path.startsWith("/api/pulls/") && path.endsWith("/exports") && req.method === "GET") {
+			const id = path.split("/")[3]!
+			return json(listExportJobs({ pullId: id }))
+		}
+
+		if (path.startsWith("/api/pulls/") && path.endsWith("/exports") && req.method === "POST") {
+			const id = path.split("/")[3]!
+			const body: any = await req.json().catch(() => ({}))
+			const pull = getPull(id)
+			if (!pull) return error("Not found", 404)
+			const job = createExportJob({
+				pullId: id,
+				projectId: pull.project_id,
+				sourceId: pull.source_id,
+				destination: body.destination || "local-zip",
+				format: body.format || "markdown",
+				metadata: {
+					lineage: {
+						sourceUrl: pull.url,
+						pullDate: pull.finished_at || pull.started_at,
+						bucket: body.bucket || "",
+						extractionMethod: body.extractionMethod || "defuddle",
+						lastRefresh: pull.finished_at || null,
+					},
+					options: body.options || {},
+				},
+			})
+			return json(job)
+		}
+
 		if (path.startsWith("/api/pulls/") && req.method === "DELETE") {
 			const id = path.split("/")[3]!
 			activePulls.get(id)?.abort()
@@ -306,6 +741,7 @@ const server = Bun.serve({
 			const pullId = url.searchParams.get("pullId") || undefined
 			const projectId = url.searchParams.get("projectId") || undefined
 			const limit = parseInt(url.searchParams.get("limit") || "50", 10)
+			const mode = url.searchParams.get("mode") || "keyword"
 			let results: SearchResult[]
 			if (pullId) {
 				results = searchDocsInPull(pullId, q, limit)
@@ -314,7 +750,102 @@ const server = Bun.serve({
 			} else {
 				results = searchDocs(q, limit)
 			}
+			if (url.searchParams.has("mode") && mode !== "keyword") {
+				return json({
+					results,
+					mode: "local",
+					requestedMode: mode,
+					fallback: { from: mode, to: "local", reason: "Local Bun server uses SQLite search fallback." },
+				})
+			}
 			return json(results)
+		}
+
+		if (path === "/api/ask" && req.method === "POST") {
+			const body: any = await req.json().catch(() => ({}))
+			const question = String(body.question || "")
+			const pullId = body.pullId ? String(body.pullId) : undefined
+			const projectId = body.projectId ? String(body.projectId) : undefined
+			const bucketIds = Array.isArray(body.bucketIds) ? body.bucketIds.map(String) : []
+			const results = pullId
+				? searchDocsInPull(pullId, question, 8)
+				: projectId
+					? searchDocsInProject(projectId, question, 8)
+					: searchDocs(question, 8)
+			const answer =
+				results.length > 0
+					? `Found ${results.length} relevant document${results.length === 1 ? "" : "s"} in the local archive.`
+					: "No matching local documents found."
+			const session = createAskSession({ question, answer, bucketIds, projectId: projectId || null })
+			const citations = results.map((result) => {
+				const citation = addAskCitation({
+					sessionId: session.id,
+					documentId: result.id,
+					sourceUrl: result.url,
+					title: result.title,
+					path: result.path,
+					pullId: result.pull_id,
+					bucketId: bucketIds[0] || null,
+					snippet: result.content.slice(0, 500),
+				})
+				return {
+					id: citation.id,
+					title: result.title,
+					path: result.path,
+					url: result.url,
+					pullId: result.pull_id,
+					pullDate: getPull(result.pull_id)?.finished_at || getPull(result.pull_id)?.started_at || null,
+					bucketId: bucketIds[0] || null,
+					extractionMethod: "defuddle",
+				}
+			})
+			return json({
+				sessionId: session.id,
+				answer,
+				mode: "keyword",
+				setupRequired: true,
+				citations,
+				results,
+			})
+		}
+
+		if (path.startsWith("/api/pulls/") && path.endsWith("/ask") && req.method === "POST") {
+			const pullId = path.split("/")[3]!
+			const body: any = await req.json().catch(() => ({}))
+			const question = String(body.question || "")
+			const results = searchDocsInPull(pullId, question, 8)
+			const answer =
+				results.length > 0
+					? `Found ${results.length} relevant document${results.length === 1 ? "" : "s"} in this pull.`
+					: "No matching documents found in this pull."
+			const session = createAskSession({ question, answer, bucketIds: body.bucketIds || [] })
+			const citations = results.map((result) =>
+				addAskCitation({
+					sessionId: session.id,
+					documentId: result.id,
+					sourceUrl: result.url,
+					title: result.title,
+					path: result.path,
+					pullId: result.pull_id,
+					bucketId: Array.isArray(body.bucketIds) ? body.bucketIds[0] : null,
+					snippet: result.content.slice(0, 500),
+				}),
+			)
+			return json({
+				sessionId: session.id,
+				answer,
+				mode: "keyword",
+				setupRequired: true,
+				citations: citations.map((citation) => ({
+					id: citation.id,
+					title: citation.title,
+					path: citation.path,
+					url: citation.source_url,
+					pullId: citation.pull_id,
+					bucketId: citation.bucket_id,
+				})),
+				results,
+			})
 		}
 
 		// --- Export pull as ZIP ---
@@ -369,12 +900,78 @@ const server = Bun.serve({
 
 		// --- Document single ---
 
+		if (path.startsWith("/api/docs/") && path.endsWith("/diagnostics") && req.method === "GET") {
+			const docId = parseInt(path.split("/")[3]!, 10)
+			if (Number.isNaN(docId)) return error("Invalid doc id", 400)
+			return json(listDocumentDiagnostics(docId))
+		}
+
+		if (path.startsWith("/api/docs/") && path.endsWith("/diagnostics") && req.method === "POST") {
+			const docId = parseInt(path.split("/")[3]!, 10)
+			if (Number.isNaN(docId)) return error("Invalid doc id", 400)
+			const body: any = await req.json().catch(() => ({}))
+			return json(
+				recordDocumentDiagnostics({
+					documentId: docId,
+					versionId: body.versionId ?? null,
+					extractionConfidence: Number(body.extractionConfidence ?? 0),
+					wordCount: Number(body.wordCount ?? 0),
+					titleFound: !!body.titleFound,
+					markdownQuality: Number(body.markdownQuality ?? 0),
+					renderMode: body.renderMode || "fetch",
+					failedSelectors: Array.isArray(body.failedSelectors) ? body.failedSelectors : [],
+					screenshotPath: body.screenshotPath ?? null,
+					pdfPath: body.pdfPath ?? null,
+					notes: body.notes || "",
+				}),
+			)
+		}
+
+		if (path.startsWith("/api/docs/") && path.endsWith("/extracts") && req.method === "GET") {
+			const docId = parseInt(path.split("/")[3]!, 10)
+			if (Number.isNaN(docId)) return error("Invalid doc id", 400)
+			const kind = url.searchParams.get("kind") as any
+			return json(listStructuredExtracts(docId, kind || undefined))
+		}
+
+		if (path.startsWith("/api/docs/") && path.endsWith("/extracts") && req.method === "POST") {
+			const docId = parseInt(path.split("/")[3]!, 10)
+			if (Number.isNaN(docId)) return error("Invalid doc id", 400)
+			const body: any = await req.json().catch(() => ({}))
+			const doc = getDocById(docId)
+			if (!doc) return error("Not found", 404)
+			const kind = body.kind || "custom"
+			const data =
+				body.data ??
+				(kind === "entities"
+					? {
+							title: doc.title,
+							url: doc.url,
+							headings: [...doc.content.matchAll(/^#{1,3}\s+(.+)$/gm)].map((match) => match[1]),
+						}
+					: { title: doc.title, url: doc.url, text: doc.content.slice(0, 2000) })
+			return json(
+				createStructuredExtract({
+					documentId: docId,
+					versionId: body.versionId ?? null,
+					kind,
+					schema: body.schema || { generatedBy: "local-fallback" },
+					data,
+					format: body.format || "json",
+				}),
+			)
+		}
+
 		if (path.startsWith("/api/docs/") && req.method === "GET") {
 			const docId = parseInt(path.split("/")[3]!, 10)
 			if (Number.isNaN(docId)) return error("Invalid doc id", 400)
 			const doc = getDocById(docId)
 			if (!doc) return error("Not found", 404)
-			return json(doc)
+			return json({
+				...doc,
+				diagnostics: listDocumentDiagnostics(docId),
+				extracts: listStructuredExtracts(docId),
+			})
 		}
 
 		// --- Project CRUD ---
@@ -442,28 +1039,29 @@ const server = Bun.serve({
 		// --- Source/destination status ---
 
 		if (path === "/api/source-status" && req.method === "GET") {
-			const doctor = getDoctorResult()
-			getYtDlpInstalled()
+			const youtube = getYtDlpStatus()
+			const twitter = getTwitterStatus()
 			const gws = getGwsAuthStatus()
+			const gdrive = {
+				installed: gws.installed,
+				authenticated: gws.authenticated,
+				message: gws.authenticated ? "Ready - Drive OAuth configured" : "Run gws auth login to connect Google Drive",
+			}
 			return json({
-				youtube: {
-					installed: doctor.connected,
-					authenticated: doctor.connected,
-					message: doctor.connected
-						? "Ready"
-						: "Chrome extension not connected. Install from https://github.com/jackwener/opencli/releases",
+				youtube,
+				twitter,
+				gdrive,
+				agentMemory: {
+					installed: false,
+					authenticated: false,
+					status: "setup-required",
+					message: "Cloudflare Agent Memory is available in the Worker deployment.",
 				},
-				twitter: {
-					installed: doctor.connected,
-					authenticated: doctor.connected,
-					message: doctor.connected
-						? "Ready"
-						: "Chrome extension not connected. Install from https://github.com/jackwener/opencli/releases",
-				},
-				gdrive: {
-					installed: gws.installed,
-					authenticated: gws.authenticated,
-					message: gws.authenticated ? "Authenticated" : "Run gws auth login to connect Google Drive",
+				docsForAgents: {
+					installed: false,
+					authenticated: false,
+					status: "setup-required",
+					message: "AI Search/Docs for Agents is available in the Worker deployment.",
 				},
 			})
 		}
@@ -476,6 +1074,12 @@ const server = Bun.serve({
 					authenticated: gws.authenticated,
 					message: gws.authenticated ? "Ready to push" : "Run gws auth login to connect",
 				},
+				artifacts: {
+					installed: false,
+					authenticated: false,
+					status: "setup-required",
+					message: "Cloudflare Artifacts are available in the Worker deployment; local publish falls back to export.",
+				},
 			})
 		}
 
@@ -487,17 +1091,43 @@ const server = Bun.serve({
 			const body: any = await req.json().catch(() => ({}))
 			const { source, target } = body
 			if (!source || !target) return error("source and target required")
-			return json({ items: [], total: 0 })
+			const adapter = SOURCE_ADAPTERS[source]
+			if (!adapter) return error(`Unknown source: ${source}`, 400)
+			const items = await Effect.runPromise(
+				adapter.discover({ target, max: Number(body.max || 10), outDir: resolve(PULLS_DIR) }),
+			)
+			return json({ items: items.map((item: SourceItem) => ({ ...item, meta: item.meta ?? {} })), total: items.length })
 		}
 
 		if (path === "/api/destination/push" && req.method === "POST") {
 			const body: any = await req.json().catch(() => ({}))
 			const { pullId, destination } = body
 			if (!pullId || !destination) return error("pullId and destination required")
+			if (destination === "artifact" || destination === "artifacts") {
+				return json({
+					ok: 0,
+					err: 0,
+					destination: "local-export",
+					status: "fallback",
+					fallback: { from: "artifact", to: "local-export", reason: "Cloudflare Artifacts require Worker deployment." },
+					files: [],
+				})
+			}
 			const gws = getGwsAuthStatus()
 			if (!gws.authenticated)
 				return error("Google Drive not authenticated. Click the Connect button in the Pull tab to sign in first.", 401)
 			return json({ ok: 0, err: 0, files: [], note: "Google Drive push not yet implemented" })
+		}
+
+		if (
+			(path.startsWith("/api/pulls/") && path.endsWith("/artifact") && req.method === "POST") ||
+			(path === "/api/artifact/publish" && req.method === "POST")
+		) {
+			return json({
+				status: "fallback",
+				destination: "local-export",
+				fallback: { from: "artifact", to: "local-export", reason: "Cloudflare Artifacts require Worker deployment." },
+			})
 		}
 
 		if (path === "/api/auth/gdrive" && req.method === "POST") {

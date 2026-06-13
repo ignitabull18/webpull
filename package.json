@@ -31,6 +31,7 @@
 	},
 	"dependencies": {
 		"@modelcontextprotocol/sdk": "^1.29.0",
+		"agents": "^0.16.0",
 		"defuddle": "^0.18.1",
 		"effect": "^3.21.2",
 		"linkedom": "^0.18.12",
@@ -54,6 +55,7 @@
 		"test:cli": "bun run test/cli.ts",
 		"test:cloudflare-ui": "bun run test/cloudflare-ui.ts",
 		"test:cloudflare-mcp": "bun run test/cloudflare-mcp.ts",
+		"test:cloudflare-enhancements": "bun run test/cloudflare-enhancements.ts",
 		"test:cloudflare-sources": "bun run test/cloudflare-sources.ts",
 		"test:db": "bun run test/db.ts",
 		"test:e2e": "bun run test/e2e.ts",

@@ -42,6 +42,12 @@
 | `scripts/daemon.ts` | Detached server launcher |
 | `ui/` | React web frontend |
 
+## Product roadmap
+
+- `docs/collector-roadmap.md` is the current implementation plan for turning webpull into a living knowledge collector.
+- Keep that roadmap aligned when adding saved sources, recurring refreshes, projects, change tracking, diagnostics, structured extraction, Ask across buckets, authenticated connectors, lineage, watch alerts, or export destinations.
+- Cloudflare-backed collector work should consider Workers Workflows/Cron, Durable Objects/Queues, Browser Run Playwright, Workers AI/AI Search/Vectorize, Agents SDK/MCP, R2/Artifacts, Secrets Store, AI Gateway, and budget alerts.
+
 ## Web UI (`ui/`)
 
 - React 19 with `react-router-dom` v7, served by Bun with on-the-fly TSX transpilation
@@ -72,5 +78,6 @@ The daemon launcher is at `scripts/daemon.ts` — it uses `Bun.spawn({ detached:
 - Server smoke: `bun run start` → builds UI, starts on http://localhost:3456
 - Browser E2E (Playwright): `WEBPULL_PORT=3461 bun run server:start && WEBPULL_PORT=3461 bun run test/e2e.ts`
 - CLI regression: `bun run src/index.ts https://example.com -m 5`
+- Cloudflare enhancement contracts: `bun run test:cloudflare-enhancements`
 - Database at `~/.webpull/webpull.db` (SQLite WAL mode, FTS5)
 - Before publishing: ensure `bun run tsc --noEmit` and `bun run biome check` pass clean

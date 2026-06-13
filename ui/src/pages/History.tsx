@@ -26,6 +26,8 @@ interface SearchResult {
 	pull_url: string
 }
 
+type SearchMode = "keyword" | "semantic" | "hybrid"
+
 const STATUS_ICON: Record<string, string> = {
 	complete: "✓",
 	running: "○",
@@ -38,6 +40,7 @@ export default function History() {
 	const navigate = useNavigate()
 	const [pulls, setPulls] = useState<PullSummary[]>([])
 	const [searchQuery, setSearchQuery] = useState("")
+	const [searchMode, setSearchMode] = useState<SearchMode>("hybrid")
 	const [searchResults, setSearchResults] = useState<SearchResult[] | null>(null)
 	const [loading, setLoading] = useState(true)
 
@@ -61,10 +64,11 @@ export default function History() {
 			return
 		}
 		try {
-			const res = await fetch(`/api/search?q=${encodeURIComponent(searchQuery)}`)
+			const params = new URLSearchParams({ q: searchQuery, mode: searchMode })
+			const res = await fetch(`/api/search?${params.toString()}`)
 			if (res.ok) setSearchResults((await res.json()) as SearchResult[])
 		} catch {}
-	}, [searchQuery])
+	}, [searchQuery, searchMode])
 
 	useEffect(() => {
 		const timer = setTimeout(handleSearch, 300)
@@ -93,6 +97,18 @@ export default function History() {
 			<p className="subtitle">Past pulls and full-text search across all downloaded content.</p>
 
 			<div className="search-bar">
+				<div className="compact-control-row">
+					<label htmlFor="history-search-mode">Mode</label>
+					<select
+						id="history-search-mode"
+						value={searchMode}
+						onChange={(e) => setSearchMode((e.target as HTMLSelectElement).value as SearchMode)}
+					>
+						<option value="hybrid">Hybrid</option>
+						<option value="semantic">Semantic</option>
+						<option value="keyword">Keyword</option>
+					</select>
+				</div>
 				<input
 					type="search"
 					placeholder="Search across all pulled docs…"

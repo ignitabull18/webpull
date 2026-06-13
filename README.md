@@ -98,6 +98,8 @@ The Cloudflare runtime supports public website documentation pulls plus public Y
 
 Private account-only sources such as X bookmarks or private Google Drive files require those items to be publicly shared or a future OAuth-backed account connection.
 
+The next hosted collector roadmap is tracked in [docs/collector-roadmap.md](docs/collector-roadmap.md). It covers saved sources, recurring refreshes, projects, change tracking, extraction diagnostics, structured exports, Ask across buckets, authenticated connectors, lineage, watch alerts, and Cloudflare-backed architecture choices such as Workflows/Cron, Durable Objects/Queues, Browser Run Playwright, Workers AI/AI Search/Vectorize, Agents SDK/MCP, R2/Artifacts, Secrets Store, AI Gateway, and budget alerts.
+
 Run the live production smoke after a Cloudflare deploy:
 
 ```bash
@@ -149,7 +151,9 @@ bun run cloudflare:build
 bun run cloudflare:types
 bun run tsc --noEmit
 bun run test/cloudflare-extract.ts
+bun run test:cloudflare-enhancements
 bun run test:db
+bun run test:api
 bun run test:cli
 bun run build:ui
 bun run test:pack

@@ -103,6 +103,13 @@ const STATUS_ICON: Record<string, string> = {
 	failed: "✕",
 }
 
+const CLOUDFLARE_CAPABILITIES = [
+	{ label: "Workers", detail: "Edge pulls" },
+	{ label: "Browser", detail: "SPA render" },
+	{ label: "AI Search", detail: "Hybrid ask" },
+	{ label: "R2", detail: "Artifacts" },
+]
+
 // --- Helpers ---
 
 function formatMime(mime: string): string {
@@ -455,6 +462,16 @@ export default function Home() {
 					)
 				})}
 			</div>
+
+			<ul className="capability-strip" aria-label="Cloudflare capabilities">
+				{CLOUDFLARE_CAPABILITIES.map((capability) => (
+					<li key={capability.label} className="capability-badge">
+						<span className="capability-badge-dot" />
+						<span>{capability.label}</span>
+						<span className="capability-badge-detail">{capability.detail}</span>
+					</li>
+				))}
+			</ul>
 
 			{source && (
 				<div className="dest-selector">

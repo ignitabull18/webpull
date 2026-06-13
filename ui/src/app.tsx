@@ -1,12 +1,16 @@
 import { Route, Routes, useLocation, useNavigate } from "react-router-dom"
+import Collector from "./pages/Collector"
 import History from "./pages/History"
 import Home from "./pages/Home"
+import Knowledge from "./pages/Knowledge"
 import Projects from "./pages/Projects"
 import Pull from "./pages/Pull"
 import Results from "./pages/Results"
 
 const NAV_ITEMS = [
 	{ path: "/", label: "Pull", icon: "↓" },
+	{ path: "/collector", label: "Collector", icon: "↻" },
+	{ path: "/knowledge", label: "Knowledge", icon: "◆" },
 	{ path: "/projects", label: "Projects", icon: "📁" },
 	{ path: "/history", label: "History", icon: "☰" },
 ]
@@ -39,9 +43,11 @@ export default function App() {
 			<main className="main-content">
 				<Routes>
 					<Route path="/" element={<Home />} />
+					<Route path="/collector" element={<Collector />} />
 					<Route path="/pull/:pullId" element={<Pull />} />
 					<Route path="/results/:pullId" element={<Results />} />
 					<Route path="/history" element={<History />} />
+					<Route path="/knowledge" element={<Knowledge />} />
 					<Route path="/projects" element={<Projects />} />
 				</Routes>
 			</main>

@@ -10,21 +10,85 @@
 		"head_sampling_rate": 1
 	},
 	"vars": {
-		"RETENTION_DAYS": "7"
+		"RETENTION_DAYS": "7",
+		"WEBPULL_WORKFLOWS_ENABLED": "true",
+		"WEBPULL_AI_SEARCH_ENABLED": "true",
+		"WEBPULL_BROWSER_RECORDING_ENABLED": "true",
+		"WEBPULL_ARTIFACTS_ENABLED": "false",
+		"WEBPULL_ARTIFACTS_BLOCKED_REASON": "Cloudflare Artifacts is blocked by Cloudflare private beta feature gate code 10004 on both accessible accounts.",
+		"WEBPULL_SECRETS_ENABLED": "true",
+		"WEBPULL_AI_GATEWAY_ENABLED": "true",
+		"WEBPULL_AGENTS_SDK_ENABLED": "true",
+		"WEBPULL_AI_GATEWAY_ID": "webpull"
 	},
+	"migrations": [
+		{
+			"tag": "v1-webpull-agent",
+			"new_sqlite_classes": ["WebpullAgent"]
+		}
+	],
 	"triggers": {
 		"crons": ["17 8 * * *"]
 	},
+	"routes": [
+		{
+			"pattern": "webpull.ignitabull.org",
+			"custom_domain": true
+		}
+	],
 	"assets": {
 		"directory": "./cloudflare/dist",
 		"binding": "ASSETS",
 		"not_found_handling": "single-page-application",
-		"run_worker_first": ["/api/*", "/mcp", "/ws"]
+		"run_worker_first": ["/api/*", "/mcp", "/ws", "/agents/*"]
 	},
 	"browser": {
 		"binding": "BROWSER",
 		"remote": true
 	},
+	"ai": {
+		"binding": "AI",
+		"remote": true
+	},
+	"ai_search_namespaces": [
+		{
+			"binding": "AI_SEARCH",
+			"namespace": "default",
+			"remote": true
+		}
+	],
+	"workflows": [
+		{
+			"binding": "PULL_WORKFLOW",
+			"name": "webpull-pull-workflow",
+			"class_name": "PullWorkflow"
+		}
+	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "WEBPULL_AGENT",
+				"class_name": "WebpullAgent"
+			}
+		]
+	},
+	"secrets_store_secrets": [
+		{
+			"binding": "OPENAI_API_KEY",
+			"store_id": "d1ed492edf914ba3ae7a85b47bb82f9d",
+			"secret_name": "OPENAI_API_KEY"
+		},
+		{
+			"binding": "ANTHROPIC_API_KEY",
+			"store_id": "d1ed492edf914ba3ae7a85b47bb82f9d",
+			"secret_name": "ANTHROPIC_API_KEY"
+		},
+		{
+			"binding": "GOOGLE_AI_STUDIO",
+			"store_id": "d1ed492edf914ba3ae7a85b47bb82f9d",
+			"secret_name": "GOOGLE_AI_STUDIO"
+		}
+	],
 	"r2_buckets": [
 		{
 			"binding": "EXPORTS",
