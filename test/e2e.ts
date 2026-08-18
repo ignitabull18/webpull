@@ -8,6 +8,19 @@ const PORT = process.env.WEBPULL_PORT || "3456"
 const browser = await chromium.launch({ headless: true })
 const page = await browser.newPage({ viewport: { width: 1280, height: 800 } })
 
+// Keep UI coverage deterministic on clean CI runners that do not have optional
+// source CLIs or authenticated browser sessions installed.
+await page.route("**/api/source-status", async (route) => {
+	await route.fulfill({
+		contentType: "application/json",
+		body: JSON.stringify({
+			youtube: { installed: true, authenticated: true, message: "Ready for browser smoke test" },
+			twitter: { installed: true, authenticated: true, message: "Ready for browser smoke test" },
+			gdrive: { installed: true, authenticated: true, message: "Ready for browser smoke test" },
+		}),
+	})
+})
+
 await page.goto(`http://127.0.0.1:${PORT}`, { waitUntil: "domcontentloaded" })
 await page.waitForTimeout(1500)
 
