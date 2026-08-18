@@ -1,4 +1,4 @@
-import { htmlToMarkdown, isWeakMarkdown, metadataMarkdown, sqliteDateTime } from "../cloudflare/worker"
+import { htmlToMarkdown, isWeakMarkdown, metadataMarkdown, sqliteDateTime } from "../cloudflare/extract"
 
 let passed = 0
 let failed = 0
